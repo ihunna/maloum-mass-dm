@@ -79,17 +79,15 @@ const updateClient = (data) => {
         // console.log("Received data from tasks:", data);
     }else if (data.type === 'message'){
         const _console = document.getElementById("console");
-        
+        if (!_console) return;
+
         const li = document.createElement("li");
-        const msgType = data.status;
-        
         li.innerHTML = data.msg;
-        li.classList.add(msgType)
-        
-        
-        const firstChild = _console.firstChild;
-        _console.appendChild(li); 
-        _console.scrollTop = _console.scrollHeight;
+        li.classList.add(data.status);
+        _console.appendChild(li);
+
+        const scroller = _console.parentElement;
+        scroller.scrollTop = scroller.scrollHeight;
     }
 }
 

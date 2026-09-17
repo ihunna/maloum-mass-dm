@@ -6,6 +6,13 @@ from aiohttp import ClientSession, TCPConnector
 
 Lock = threading.Lock()
 
+def _aiohttp_session(**kwargs):
+    # Temporary mitmweb bypass: mitmproxy's cert fails normal TLS verify.
+    # Set MITMWEB=0 in .env to restore certificate verification.
+    if os.getenv('MITMWEB', '1').strip().lower() not in ('0', 'false', 'no'):
+        kwargs.setdefault('connector', TCPConnector(ssl=False))
+    return aiohttp.ClientSession(**kwargs)
+
 # Define a custom exception
 class Cancelled(Exception):
     """Custom exception for specific error handling."""
@@ -171,16 +178,43 @@ class Creator:
             'origin': 'https://app.maloum.com',
             'priority': 'u=1, i',
             'referer': 'https://app.maloum.com/',
-            'sec-ch-ua': '"Not(A:Brand";v="99", "Google Chrome";v="133", "Chromium";v="133"',
+            'sec-ch-ua': '"Not=A?Brand";v="99", "Google Chrome";v="151", "Chromium";v="151"',
             'sec-ch-ua-mobile': '?1',
             'sec-ch-ua-platform': '"Android"',
             'sec-fetch-dest': 'empty',
             'sec-fetch-mode': 'cors',
-            'sec-fetch-site': 'same-site'
+            'sec-fetch-site': 'same-site',
+            'user-agent': 'Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Mobile Safari/537.36',
+            'x-timezone': 'Africa/Lagos',
         }
         self._message_cache = {}  # Cache for recent recipients per creator
         self.scraped_cache = []
         self.categories = Utils.load_categories()
+
+    @staticmethod
+    def _trace_headers():
+        trace_id = os.urandom(16).hex()
+        original = f'00-{trace_id}-{os.urandom(8).hex()}-01'
+        current = f'00-{trace_id}-{os.urandom(8).hex()}-01'
+        return {
+            'traceparent': current,
+            'x-original-traceparent': original,
+        }
+
+    @staticmethod
+    async def _response_json(response):
+        text = await response.text()
+        if text.lstrip().startswith('<') or 'Just a moment' in text or 'cf-mitigated' in response.headers:
+            raise Exception(
+                'Maloum blocked this request with a Cloudflare challenge. '
+                'The proxy or IP is being challenged; try another proxy.'
+            )
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError as error:
+            raise Exception(
+                f'Invalid JSON from Maloum ({response.status}): {text[:180]}'
+            ) from error
         
     def format_proxy(self,proxies):
         return proxies['http']
@@ -192,7 +226,7 @@ class Creator:
             return ''.join(random.choices(string.ascii_letters.upper() + string.digits + string.ascii_letters, k=8))
 
     async def update_media_id(self, post_id, creator, creator_id):
-        async with aiohttp.ClientSession(headers=creator.get('data', {}).get('headers')) as session:
+        async with _aiohttp_session(headers=creator.get('data', {}).get('headers')) as session:
             session.headers.update({'user-agent': Utils.generate_user_agent('android', 1)})
             proxies = Utils.format_proxy(random.choice(self.proxies)) if not creator.get('reuse_ip') else creator.get('proxies')
             try:
@@ -243,7 +277,7 @@ class Creator:
                 'user-agent': Utils.generate_user_agent('android', 1),
             }
 
-            async with aiohttp.ClientSession(headers=headers) as session:
+            async with _aiohttp_session(headers=headers) as session:
                 # session.cookie_jar.update_cookies(scraper.get('cookies'))
                 proxies = scraper.get('proxies', Utils.format_proxy(random.choice(self.proxies))) \
                     if scraper.get('reuse_ip', True) else Utils.format_proxy(random.choice(self.proxies))
@@ -482,8 +516,9 @@ class Creator:
 
             Utils.write_log(f"--- Fetching users from DB (unmessaged by {creator_name}) offset {offset} ---")
 
-            async with aiohttp.ClientSession() as session:
+            async with _aiohttp_session() as session:
                 session.headers.update(creator_data.get('headers'))
+                session.headers.update(self._trace_headers())
                 session.cookie_jar.update_cookies(creator_data.get('cookies'))
                 proxies = creator_data.get('proxies', Utils.format_proxy(random.choice(self.proxies))) if creator_data.get('reuse_ip', True) else Utils.format_proxy(random.choice(self.proxies))
 
@@ -507,6 +542,7 @@ class Creator:
                     offset += limit
 
                 success_messages = 0
+                backfilled_messages = 0
 
                 random.shuffle(users)
 
@@ -617,14 +653,16 @@ class Creator:
                                         }
                                         Utils.update_client(client_msg)
                                         Utils.write_log(f"--- Backfilled last sent message for user @{username} by {creator_name} ---")
+                                        backfilled_messages += 1
                                         continue
                                     else:
                                         Utils.write_log(f"--- Failed to backfill last sent message for {username}: {add_msg_resp} ---")
                                         continue
                                 
                                 else:
-                                    client_msg = {'msg': f"Skipping chat with {recipient_id} because it already has a message", 'status': 'error', 'type': 'message'}
+                                    client_msg = {'msg': f"Skipping chat with {username} because it already has a message", 'status': 'error', 'type': 'message'}
                                     success, msg = Utils.update_client(client_msg)
+                                    continue
 
                         # Prepare message
                         chosen_caption = random.choice(captions) if caption_source == 'creator' else caption
@@ -709,15 +747,16 @@ class Creator:
             
             if success_messages > 0:
                 return True, f'Successfully sent messages to {success_messages} users by {creator_name}'
-            else:
-                return False, f'{creator_name} could not send any messages to users'
+            if backfilled_messages > 0:
+                return True, f'No new messages sent by {creator_name}; recorded {backfilled_messages} existing chats'
+            return False, f'{creator_name} could not send any messages to users'
 
         except Exception as e:
             return False, f'Error sending messages to users for {creator.get("id")}: {str(e)}'
 
 
     async def login(self, admin, email, password, reuse_ip=True, task_id=None, category='creators'):
-        async with aiohttp.ClientSession() as session:
+        async with _aiohttp_session() as session:
             try:
                 success, task_status = Utils.check_task_status(task_id) if task_id else (False, 'No task ID provided')
                 if not success:
@@ -737,8 +776,11 @@ class Creator:
                 else:proxies = Utils.format_proxy(random.choice(self.proxies))
                 proxies = Utils.format_proxy(random.choice(self.proxies))
 
+                print(f'--- Logging in {email} with proxy {proxies} ---')
+
                 if not new_user:
                     session.headers.update(user_data.get('headers', {}))
+                    session.headers.update(self._trace_headers())
                     refresh_token = user_data['details']['user']['refreshToken']
                     token = user_data['details']['user']['accessToken']
                     if category=='creators':Utils.write_log(f'token before refresh {token}')
@@ -786,6 +828,7 @@ class Creator:
 
 
                 session.headers.update(self.headers)
+                session.headers.update(self._trace_headers())
                 session.headers.update({'user-agent': Utils.generate_user_agent('android', 1)})
                 
                 async with session.post(
@@ -795,17 +838,20 @@ class Creator:
                     timeout=60
                 ) as response:
                     if response.status == 401:
-                        return True, 'Credentials not correct'
+                        return False, 'Credentials not correct'
                     if not response.ok:
                         user_data['status'] = 'Offline'
-                        return False, await response.text()
+                        body = await response.text()
+                        if body.lstrip().startswith('<') or 'Just a moment' in body:
+                            return False, 'Maloum blocked login with a Cloudflare challenge. Try another proxy.'
+                        return False, body[:500]
 
-                    login_data = await response.json()
+                    login_data = await self._response_json(response)
                     token, refresh_token = login_data['accessToken'], login_data['refreshToken']
                     session.headers.update({
                         'apikey': 'sb_publishable_4zljSqmEuxGuqPttJAK_kg_XzInyyJ9',
                         'authorization': f'Bearer {token}',
-                        'x-client-info': 'supabase-js-web/2.50.3',
+                        'x-client-info': 'supabase-js-web/2.103.2',
                         'x-supabase-api-version': '2024-01-01',
                     })
 
@@ -910,43 +956,46 @@ class _MALOUM:
         }
 
     async def add_creators(self, admin, task, creators, category):
-        task_status, task_msg, completed, fails = 'failed', f'Started logging in creators for {task["id"]}', 0, 0
+        task_status, task_msg, completed, fails = 'running', f'Started logging in creators for {task["id"]}', 0, 0
+        task_id = task['id']
         try:
             Utils.write_log(f'=== Add {category} started for {task["id"]} ===')
-            task_id = task['id']
 
             async def login_creator(creator):
-                success, task_status = Utils.check_task_status(task_id)
+                success, current_task = Utils.check_task_status(task_id)
                 if not success:
-                    raise Exception(task_status)
-                if task_status['status'].lower() in ['cancelled', 'canceled']:
+                    raise Exception(current_task)
+                if current_task['status'].lower() in ['cancelled', 'canceled']:
                     return False, 'Task canceled'
-                return await Creator().login(admin, creator['email'], creator['password'], task_id=task_id, category=category)
+                ok, msg = await Creator().login(admin, creator['email'], creator['password'], task_id=task_id, category=category)
+                if not ok:
+                    return False, f"{creator.get('email')}: {msg}"
+                return True, msg
 
             tasks = [login_creator(creator) for creator in creators]
             results = await asyncio.gather(*tasks, return_exceptions=True)
 
-            for success, result in results:
+            for item in results:
+                if isinstance(item, Exception):
+                    success, result = False, str(item)
+                elif isinstance(item, (tuple, list)) and len(item) == 2:
+                    success, result = item
+                else:
+                    success, result = False, str(item)
+
                 if success:
                     completed += 1
-                    client_msg = {'msg': f'{completed} {category} added so far on task:{task_id}', 'status': 'success', 'type': 'message'}
-                    success, msg = Utils.update_client(client_msg)
-                    if not success:
-                        Utils.write_log(msg)
+                    task_msg = f'{completed} {category} added so far on task:{task_id}'
+                    Utils.push_task_update(task, 'running', task_msg, client_status='success')
                 elif result == 'Task canceled':
                     task_status = 'canceled'
-                    client_msg = {'msg': f'{result} task:{task_id}', 'status': 'error', 'type': 'message'}
-                    success, msg = Utils.update_client(client_msg)
-                    if not success:
-                        Utils.write_log(msg)
+                    task_msg = f'{result} task:{task_id}'
+                    Utils.push_task_update(task, task_status, task_msg)
                     break
                 else:
                     fails += 1
-                    client_msg = {'msg': f'{fails} creators failed so far on task:{task_id}', 'status': 'error', 'type': 'message'}
-                    success, msg = Utils.update_client(client_msg)
-                    if not success:
-                        Utils.write_log(msg)
-                    task_msg = result
+                    task_msg = str(result)
+                    Utils.push_task_update(task, 'running', task_msg, client_status='error')
 
                 Utils.write_log(task_msg)
 
@@ -954,38 +1003,21 @@ class _MALOUM:
             Utils.write_log(e)
             task_status = 'failed'
             task_msg = f'Error adding creators on {task_id}: {e}'
+            Utils.push_task_update(task, task_status, task_msg)
 
         finally:
             if task_status == 'canceled':
-                client_msg = {'msg': f'{task_id} was canceled', 'status': 'error', 'type': 'message'}
-                task_msg = client_msg['msg']
+                pass
             elif completed == len(creators) and len(creators) > 0:
                 task_status = 'success'
-                client_msg = {'msg': f'{task_id} successful', 'status': 'success', 'type': 'message'}
-            elif fails > len(creators) // 2:
-                client_msg = {'msg': f'{task_id} failed', 'status': 'error', 'type': 'message'}
+                task_msg = f'{task_id} successful'
+            elif fails > 0:
                 task_status = 'failed'
-                task_msg = client_msg['msg']
-            elif task_status == 'failed':
-                client_msg = {'msg': f'{task_id} failed', 'status': 'error', 'type': 'message'}
             else:
                 task_status = 'completed'
-                client_msg = {'msg': f'{completed} items successful task:{task_id}', 'status': 'success', 'type': 'message'}
-                task_msg = client_msg['msg']
+                task_msg = f'{completed} items successful task:{task_id}'
 
-            success, msg = Utils.update_client(client_msg)
-            if not success:
-                Utils.write_log(msg)
-
-            success, msg = Utils.update_task(task_id, {'status': task_status, 'message': task_msg})
-            if not success:
-                Utils.write_log(msg)
-
-            task_data = task
-            task_data.update({'updated': str(datetime.now()), 'status': task_status})
-            success, msg = Utils.update_client({'task': task_data, 'type': 'task'})
-            if not success:
-                Utils.write_log(msg)
+            Utils.push_task_update(task, task_status, task_msg)
 
     async def start_messaging(self, task, max_actions=20):
         task_status, task_msg = 'failed', f'Started messaging for {task["id"]}'

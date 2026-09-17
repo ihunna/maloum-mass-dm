@@ -273,24 +273,21 @@ def handle_creators(action):
             def run_add_creators():
                 result = run_async_coroutine(_MALOUM().add_creators(admin, task_data, creators, category))
 
-            task = Thread(target=run_add_creators)
-            task.start()
-            
+            task = socketio.start_background_task(run_add_creators)
+
             if task.is_alive():
                 success,msg = Utils.update_task(task_id,{
                     'status':'running',
                     'message':'Adding creators'
                 })
-                if not success:Utils.write_log(msg)
-                
-                success,msg = Utils.update_client({'msg':f'{task_id} successfully created','status':'success','type':'message'})
-                if not success:Utils.write_log(msg)
-                
-                else:
+                if not success:
                     Utils.write_log(msg)
-                    Utils.write_log(f'Task successflly created')
-            
-                    return jsonify({'msg': f'Add {category} task successfully started'}), 200
+
+                success,msg = Utils.update_client({'msg':f'{task_id} successfully created','status':'success','type':'message'})
+                if not success:
+                    Utils.write_log(msg)
+                Utils.write_log(f'Task successfully created')
+                return jsonify({'msg': f'Add {category} task successfully started'}), 200
             else:
                 return jsonify({'msg': f'Could not start task {task_id}'}), 400
         else:
@@ -603,9 +600,8 @@ def handle_messages():
         def run_start_messaging():
             result = run_async_coroutine(_MALOUM().start_messaging(task_data, max_actions = int(data.get('max-actions', 10))))
 
-        task = Thread(target=run_start_messaging)
-        task.start()
-            
+        task = socketio.start_background_task(run_start_messaging)
+
         if task.is_alive():
             success,msg = Utils.update_task(task_id,{
                 'status':'running',
@@ -614,13 +610,10 @@ def handle_messages():
             if not success:Utils.write_log(msg)
             
             success,msg = Utils.update_client({'msg':f'Task {task_id} successfully created','status':'success','type':'message'})
-            if not success:Utils.write_log(msg)
-            
-            else:
+            if not success:
                 Utils.write_log(msg)
-                Utils.write_log(f'Task successfully created')
-
-                return jsonify({'msg': f'Task successfully started'}), 200
+            Utils.write_log(f'Task successfully created')
+            return jsonify({'msg': f'Task successfully started'}), 200
         else:
             return jsonify({'msg': f'Could not start task {task_id}'}), 400
 
@@ -682,9 +675,8 @@ def scraper():
             def run_start_scraping():
                 result = run_async_coroutine(_MALOUM().start_scraping(task_data))
 
-            task = Thread(target=run_start_scraping)
-            task.start()
-                
+            task = socketio.start_background_task(run_start_scraping)
+
             if task.is_alive():
                 success,msg = Utils.update_task(task_id,{
                     'status':'running',
@@ -692,13 +684,10 @@ def scraper():
                 })
 
                 success,msg = Utils.update_client({'msg':f'Task {task_id} successfully created','status':'success','type':'message'})
-                if not success:Utils.write_log(msg)
-                
-                else:
+                if not success:
                     Utils.write_log(msg)
-                    Utils.write_log(f'Task successfully created')
-
-                    return jsonify({'msg': f'Task successfully started'}), 200
+                Utils.write_log(f'Task successfully created')
+                return jsonify({'msg': f'Task successfully started'}), 200
                 
             else:
                 return jsonify({'msg': f'Could not start task {task_id}'}), 400
@@ -1194,7 +1183,7 @@ def login():
 def handle_client_update():
     try:
         client_msg = request.get_json()
-        socketio.emit('update-client', client_msg, callback=True)
+        socketio.emit('update-client', client_msg, namespace='/')
         return jsonify({'msg': 'client updated'}), 200
     except Exception as error:
         return jsonify({'msg': f'{error}'}), 400
@@ -1287,6 +1276,9 @@ if __name__ == "__main__":
         if not success:
             raise Exception(msg)
 
-        socketio.run(app)
+        # macOS Control Center / AirPlay already listens on port 5000
+        port = int(os.getenv('PORT', '5001'))
+        print(f'Starting server at http://127.0.0.1:{port}')
+        socketio.run(app, host='127.0.0.1', port=port, allow_unsafe_werkzeug=True)
     except Exception as error:
         Utils.write_log(error)

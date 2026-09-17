@@ -1,4 +1,4 @@
-import os, json, sys,uuid,sqlite3,base64,io,ast,httpx,time,re,shutil,random,requests,socket,math
+import os, json, sys,uuid,sqlite3,base64,io,ast,time,re,shutil,random,requests,socket,math
 from urllib.parse import urlencode, urljoin
 from os import listdir
 from os.path import isfile
@@ -14,7 +14,7 @@ from werkzeug.security import check_password_hash, generate_password_hash
 from flask_session import Session
 from flask_socketio import SocketIO
 from flask_cors import CORS
-import webview, asyncio
+import asyncio
 
 
 # adding the folder to path
@@ -57,13 +57,21 @@ load_dotenv(env_path)
 session_key = os.getenv('SECRET_KEY')
 server_key = os.getenv('SERVER_KEY')
 host = os.getenv('HOST')
-app_prefix = os.getenv('APP_PREFIX')
+app_prefix = os.getenv('APP_PREFIX') or ''
 
 # Configure application
 app = Flask(__name__)
 app.debug = True
-CORS(app,origins=host)
-socketio = SocketIO(app, path=f'{app_prefix}/socket.io')
+CORS(app, origins='*')
+socketio = SocketIO(
+    app,
+    path=f'{app_prefix}/socket.io',
+    async_mode='threading',
+    cors_allowed_origins='*',
+    transports=['polling'],
+    allow_upgrades=False,
+    manage_session=False,
+)
 
 # Ensure templates are auto-reloaded
 app.config["TEMPLATES_AUTO_RELOAD"] = True
@@ -72,6 +80,8 @@ app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024
 
 
 app.config["SESSION_TYPE"] = "filesystem"
+app.config["SESSION_FILE_DIR"] = os.path.join(parent_folder, ".flask_sessions")
+os.makedirs(app.config["SESSION_FILE_DIR"], exist_ok=True)
 app.config["SECRET_KEY"] = session_key.encode()
 app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(days=7)
 Session(app)

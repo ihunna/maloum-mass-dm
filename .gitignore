@@ -5,6 +5,7 @@ venv
 test.py
 proxies.txt
 flask_session
+.flask_sessions
 settings
 logs.txt
 app.log

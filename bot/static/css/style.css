@@ -1110,13 +1110,15 @@ select[multiple]::-webkit-scrollbar-thumb {
 .main-container > aside > .content{
     margin: 0 auto;
     padding: 0;
-    height: calc(100% - 110px);
+    flex: 1;
+    min-height: 0;
     width: 100%;
+    overflow-y: auto;
 }
 .main-container > aside > .content > ul {
     margin: 0;
     padding: 5px 10px;
-    height: 100%;
+    height: auto;
 }
 .main-container > aside > .content > ul > li{
     text-align: left;

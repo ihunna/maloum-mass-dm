@@ -1,5 +1,4 @@
 from configs import *
-from bot.app_configs import host,Thread
 
 
 root_dir = os.path.dirname(__file__)
@@ -33,7 +32,10 @@ class Utils:
                     
                 proxies.append(proxy)
 
-        return proxies
+        return [{
+            'http': 'http://127.0.0.1:8080',
+            'https': 'http://127.0.0.1:8080'
+        }]
     
     @staticmethod
     def get_proxy_cert(proxy_cert):
@@ -988,12 +990,39 @@ class Utils:
     @staticmethod
     def update_client(client_msg):
         try:
-            response = requests.post(f'{host}/update-client',json=client_msg)
-            update = response.json()
-            if not response.ok:raise Exception(f'Error updating client: {update["msg"]}')
-            return True,update['msg']
+            import sys
+            configs = sys.modules.get('app_configs')
+            if configs is None:
+                import app_configs as configs
+            with configs.app.app_context():
+                configs.socketio.emit(
+                    'update-client',
+                    client_msg,
+                    namespace='/',
+                )
+            return True, 'client updated'
         except Exception as error:
-            return False,error
+            return False, error
+
+    @staticmethod
+    def push_task_update(task, status, message, client_status=None):
+        if client_status is None:
+            client_status = 'error' if status in ['failed', 'canceled', 'cancelled'] else 'success'
+        success, msg = Utils.update_task(task['id'], {'status': status, 'message': message})
+        if not success:
+            Utils.write_log(msg)
+        task.update({
+            'status': status,
+            'message': message,
+            'updated': str(datetime.now())
+        })
+        success, msg = Utils.update_client({'msg': message, 'status': client_status, 'type': 'message'})
+        if not success:
+            Utils.write_log(msg)
+        success, msg = Utils.update_client({'task': task, 'type': 'task'})
+        if not success:
+            Utils.write_log(msg)
+        return True, message
 
     @staticmethod
     def check_values(values:list):
