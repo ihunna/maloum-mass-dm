@@ -290,6 +290,33 @@ def handle_creators(action):
                 return jsonify({'msg': f'Add {category} task successfully started'}), 200
             else:
                 return jsonify({'msg': f'Could not start task {task_id}'}), 400
+        elif action == 'reset-offset':
+            payload = request.get_json(silent=True) or {}
+            items = payload.get('data') or []
+            if not items:
+                return jsonify({'msg': 'No creators selected'}), 400
+
+            reset = 0
+            for item in items:
+                creator_id = (item or {}).get('item') or (item or {}).get('target')
+                if not creator_id:
+                    continue
+                success, creator, _ = Utils.get_creators(multiple=False, creator=creator_id)
+                if not success:
+                    Utils.write_log(creator)
+                    continue
+                if not creator:
+                    continue
+                success, msg = Creator().update(creator, {'message_offset': 0})
+                if success:
+                    reset += 1
+                else:
+                    Utils.write_log(msg)
+
+            if reset < 1:
+                return jsonify({'msg': 'Could not reset any creator offsets'}), 400
+            label = 'creator' if reset == 1 else 'creators'
+            return jsonify({'msg': f'Reset offset for {reset} {label}'}), 200
         else:
             return jsonify({'msg': 'No action specified'}), 400
     except Exception as error:
