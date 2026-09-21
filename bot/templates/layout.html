@@ -82,7 +82,7 @@
             </div>
         </div>
     </div>
-    <script src="{{ url_for('static', filename='js/settings.js') }}?v=reset-offset-3"></script>
+    <script src="{{ url_for('static', filename='js/settings.js') }}?v=app-prefix-1"></script>
     <script>
         
         const clearConsoleBtn = document.getElementById('clear-console');
@@ -117,7 +117,7 @@
                     setTimeout(() => {
                         toogleLoader('no-show');
                         setTimeout(() => {
-                            window.location.href = '/login';
+                            window.location.href = window.appUrl('/login');
                         }, 700);
                     }, 3000);
                 } else {
