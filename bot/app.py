@@ -24,6 +24,11 @@ def handle_connect():
 def before_request():
     g.host = host
     g.app_prefix = app_prefix
+    g.app_name = app_name
+    if app_logo.startswith(('http://', 'https://', '/')):
+        g.app_logo = app_logo
+    else:
+        g.app_logo = url_for('static', filename=app_logo)
 
 @app.after_request
 def after_request(response):

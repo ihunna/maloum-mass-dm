@@ -711,7 +711,8 @@ class Utils:
         try:
             cursor.execute("""INSERT INTO messages \
                 (id, admin, creator_id, creator_name, recipient_id, recipient_name, has_media, link, sender_status, caption, price, task_id) \
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO NOTHING""",
                 (message_id, admin, creator_id, creator_name, recipient_id, recipient_name, has_media, link, sender_status, caption, price, task_id))
             conn.commit()
             success, msg = True, 'Message added successfully'
@@ -720,6 +721,26 @@ class Utils:
         finally:
             conn.close()
             return success, msg
+
+    @staticmethod
+    def has_message(creator_id=None, recipient_id=None, message_id=None):
+        conn = sqlite3.connect(db_file)
+        cursor = conn.cursor()
+        try:
+            if message_id:
+                cursor.execute("SELECT 1 FROM messages WHERE id = ? LIMIT 1", (message_id,))
+            elif creator_id and recipient_id:
+                cursor.execute(
+                    "SELECT 1 FROM messages WHERE creator_id = ? AND recipient_id = ? LIMIT 1",
+                    (creator_id, recipient_id)
+                )
+            else:
+                return True, False
+            return True, cursor.fetchone() is not None
+        except Exception as error:
+            return False, str(error)
+        finally:
+            conn.close()
 
     @staticmethod
     def delete_message(message_id):

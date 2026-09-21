@@ -908,6 +908,11 @@ class Creator:
                             continue
                         username = user.get('username', 'unknown')
 
+                        already_ok, already = Utils.has_message(creator_id=creator_internal_id, recipient_id=recipient_id)
+                        if already_ok and already:
+                            Utils.write_log(f'--- Skipping {username}; already messaged by {creator_name} ---')
+                            continue
+
                         # Create new chat
                         async with session.post(
                             'https://api.maloum.com/chats',
@@ -949,6 +954,11 @@ class Creator:
                                 success, msg = Utils.update_client(client_msg)
                                 Utils.write_log(f"--- No chat ID found for user {recipient_id} ---")
                                 continue
+
+                        already_ok, already = Utils.has_message(message_id=chat_id)
+                        if already_ok and already:
+                            Utils.write_log(f'--- Skipping {username}; chat {chat_id} already recorded ---')
+                            continue
 
                         # Check for existing messages in the chat
                         async with session.get(
@@ -1065,7 +1075,10 @@ class Creator:
                             task_id
                         )
                         if not success:
-                            raise Exception(f'Error adding message to database for {username} by {creator_name}: {add_msg_resp}')
+                            Utils.write_log(f'Error adding message to database for {username} by {creator_name}: {add_msg_resp}')
+                            client_msg = {'msg': f'Error adding message to database for {username} by {creator_name}: {add_msg_resp}', 'status': 'error', 'type': 'message'}
+                            Utils.update_client(client_msg)
+                            continue
                         Utils.write_log(f'=== Successfully sent a message to {username} by {creator_name} ===')
                         
                         client_msg = {'msg': f'Successfully sent a message to {username} by {creator_name}', 'status': 'success', 'type': 'message'}
