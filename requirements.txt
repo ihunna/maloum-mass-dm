@@ -11,5 +11,6 @@ requests==2.31.0
 urllib3==2.2.0
 websocket-client==1.8.0
 Werkzeug==3.0.1
-gunicorn
-eventlet
+gunicorn[gevent]
+gevent>=24.10.1
+gevent-websocket
