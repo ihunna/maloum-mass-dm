@@ -1,17 +1,338 @@
 from app_configs import creators_file,configs_folder,universal_files
 from utils import Utils
 from configs import *
-import io, threading, socketio, asyncio, aiohttp, ssl, functools, traceback
-from aiohttp import ClientSession, TCPConnector
+import io, threading, socketio, asyncio, traceback
+from urllib.parse import urlparse
+from curl_cffi.requests import AsyncSession
+from curl_cffi.requests.exceptions import RequestException
 
 Lock = threading.Lock()
 
-def _aiohttp_session(**kwargs):
+def _mitmweb_enabled():
     # Temporary mitmweb bypass: mitmproxy's cert fails normal TLS verify.
     # Set MITMWEB=0 in .env to restore certificate verification.
-    if os.getenv('MITMWEB', '1').strip().lower() not in ('0', 'false', 'no'):
-        kwargs.setdefault('connector', TCPConnector(ssl=False))
-    return aiohttp.ClientSession(**kwargs)
+    return os.getenv('MITMWEB', '1').strip().lower() not in ('0', 'false', 'no')
+
+
+def _tls_impersonate():
+    # Python's ssl/httpx cannot reproduce mitmproxy's ClientHello. curl_cffi can.
+    # chrome_android matches the Android Chrome headers already sent to Maloum.
+    return os.getenv('TLS_IMPERSONATE', 'chrome_android').strip() or 'chrome_android'
+
+
+def _cookies_as_dict(cookies):
+    if not cookies:
+        return {}
+    if hasattr(cookies, 'jar'):
+        return {cookie.name: cookie.value for cookie in cookies.jar}
+    if hasattr(cookies, 'items'):
+        return dict(cookies.items())
+    return dict(cookies)
+
+
+DEFAULT_TIMEOUT = 120
+
+
+class NetworkError(Exception):
+    """Retryable transport failure (timeout, proxy, TLS, reset)."""
+
+
+def _redact_proxy(proxy):
+    if not isinstance(proxy, str) or not proxy:
+        return proxy
+    parsed = urlparse(proxy)
+    if not parsed.password:
+        return proxy
+    host = parsed.hostname or ''
+    port = f':{parsed.port}' if parsed.port else ''
+    user = parsed.username or ''
+    return f'{parsed.scheme}://{user}:***@{host}{port}'
+
+
+def _timeout_seconds(timeout):
+    if isinstance(timeout, tuple):
+        return sum(float(part) for part in timeout)
+    if timeout is None:
+        return float(DEFAULT_TIMEOUT)
+    return float(timeout)
+
+
+def _format_network_error(error, method=None, url=None, proxy=None, timeout=None):
+    raw = str(error).splitlines()[0].strip()
+    lower = raw.lower()
+    if 'curl: (28)' in raw or 'timed out' in lower:
+        waited = f' after {_timeout_seconds(timeout):.0f}s' if timeout is not None else ''
+        reason = f'Request timed out{waited}'
+    elif 'curl: (7)' in raw:
+        reason = 'Could not connect'
+    elif 'curl: (56)' in raw:
+        reason = 'Connection reset'
+    elif 'curl: (35)' in raw:
+        reason = 'TLS handshake failed'
+    else:
+        reason = raw[:180]
+
+    details = []
+    if method and url:
+        details.append(f'{method} {url}')
+    if proxy:
+        details.append(f'proxy {_redact_proxy(proxy)}')
+    if details:
+        return f'{reason} ({", ".join(details)})'
+    return reason
+
+
+async def _http_failure(response, action):
+    body = (await response.text() or '').strip()
+    snippet = ' '.join(body.split())[:240] or 'empty body'
+    if snippet.lstrip().startswith('<') or 'Just a moment' in snippet or 'cf-mitigated' in response.headers:
+        return f'{action} blocked by Cloudflare (HTTP {response.status})'
+    return f'{action} failed (HTTP {response.status}): {snippet}'
+
+
+def _is_retryable_error(result):
+    if isinstance(result, NetworkError):
+        return True
+    if not isinstance(result, str):
+        return False
+    text = result.lower()
+    return any(token in text for token in (
+        'timed out', 'could not connect', 'network error', 'connection reset',
+        'tls handshake', 'cloudflare', 'challenge', 'try another proxy',
+        'curl: (28)', 'curl: (7)', 'curl: (56)', 'curl: (35)',
+    ))
+
+
+class _Headers(dict):
+    """Case-insensitive headers, matching aiohttp's CIMultiDict usage."""
+
+    @staticmethod
+    def _norm(key):
+        return str(key).lower()
+
+    def __init__(self, data=None):
+        super().__init__()
+        if data:
+            self.update(data)
+
+    def update(self, other=None, **kwargs):
+        if other:
+            items = other.items() if hasattr(other, 'items') else other
+            for key, value in items:
+                self[key] = value
+        for key, value in kwargs.items():
+            self[key] = value
+        return None
+
+    def __setitem__(self, key, value):
+        super().__setitem__(self._norm(key), value)
+
+    def __getitem__(self, key):
+        return super().__getitem__(self._norm(key))
+
+    def __delitem__(self, key):
+        super().__delitem__(self._norm(key))
+
+    def __contains__(self, key):
+        return super().__contains__(self._norm(key))
+
+    def get(self, key, default=None):
+        return super().get(self._norm(key), default)
+
+    def pop(self, key, *args):
+        return super().pop(self._norm(key), *args)
+
+
+class _CookieJar:
+    def __init__(self):
+        self._pending = {}
+        self._client = None
+
+    def bind(self, client):
+        self._client = client
+        if self._pending:
+            client.cookies.update(self._pending)
+            self._pending.clear()
+
+    def update_cookies(self, cookies):
+        if not cookies:
+            return
+        data = dict(cookies)
+        if self._client is not None:
+            self._client.cookies.update(data)
+        else:
+            self._pending.update(data)
+
+    def filter_cookies(self, url):
+        matched = dict(self._pending)
+        if self._client is None:
+            return matched
+        cookies = getattr(self._client, 'cookies', None)
+        if hasattr(cookies, 'jar'):
+            host = (urlparse(url).hostname or '').lower()
+            for cookie in cookies.jar:
+                domain = (cookie.domain or '').lstrip('.').lower()
+                if not domain or not host or host == domain or host.endswith('.' + domain):
+                    matched[cookie.name] = cookie.value
+            return matched
+        matched.update(_cookies_as_dict(cookies))
+        return matched
+
+    def snapshot(self):
+        cookies = dict(self._pending)
+        if self._client is not None:
+            cookies.update(_cookies_as_dict(getattr(self._client, 'cookies', None)))
+        return cookies
+
+
+_CURL_HTTP_VERSIONS = {
+    1: 'HTTP/1.0',
+    2: 'HTTP/1.1',
+    3: 'HTTP/2',
+    4: 'HTTP/2',
+    5: 'HTTP/2',
+    30: 'HTTP/3',
+}
+
+
+class _HttpResponse:
+    def __init__(self, response):
+        self._response = response
+        self.status = response.status_code
+        self.headers = response.headers
+        version = getattr(response, 'http_version', None)
+        self.http_version = _CURL_HTTP_VERSIONS.get(version, version)
+
+    @property
+    def ok(self):
+        is_success = getattr(self._response, 'is_success', None)
+        if is_success is not None:
+            return is_success
+        return 200 <= self.status < 300
+
+    async def text(self):
+        text = self._response.text
+        if asyncio.iscoroutine(text):
+            return await text
+        return text
+
+    async def json(self):
+        data = self._response.json()
+        if asyncio.iscoroutine(data):
+            return await data
+        return data
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        close = getattr(self._response, 'aclose', None) or getattr(self._response, 'close', None)
+        if not close:
+            return
+        result = close()
+        if asyncio.iscoroutine(result):
+            await result
+
+
+class _RequestContext:
+    def __init__(self, session, method, url, kwargs):
+        self._session = session
+        self._method = method
+        self._url = url
+        self._kwargs = kwargs
+        self._response = None
+
+    async def __aenter__(self):
+        self._response = await self._session._request(self._method, self._url, **self._kwargs)
+        return self._response
+
+    async def __aexit__(self, exc_type, exc, tb):
+        if self._response is not None:
+            return await self._response.__aexit__(exc_type, exc, tb)
+
+
+class _HttpSession:
+    """curl_cffi session with browser TLS/HTTP2 fingerprints, aiohttp-style API."""
+
+    def __init__(self, headers=None):
+        self.headers = _Headers(headers or {})
+        self.cookie_jar = _CookieJar()
+        self._client = None
+        self._proxy = None
+        self._lock = asyncio.Lock()
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        await self.close()
+
+    @staticmethod
+    def _normalize_proxy(proxy):
+        if isinstance(proxy, dict):
+            return proxy.get('http') or proxy.get('https')
+        return proxy
+
+    async def _ensure_client(self, proxy=None):
+        proxy = self._normalize_proxy(proxy)
+        async with self._lock:
+            if self._client is not None and (proxy is None or proxy == self._proxy):
+                return
+            cookies = self.cookie_jar.snapshot()
+            if self._client is not None:
+                await self._client.close()
+            if proxy is not None:
+                self._proxy = proxy
+            self._client = AsyncSession(
+                impersonate=_tls_impersonate(),
+                proxy=self._proxy,
+                verify=not _mitmweb_enabled(),
+                allow_redirects=True,
+                cookies=cookies,
+                timeout=DEFAULT_TIMEOUT,
+            )
+            self.cookie_jar.bind(self._client)
+
+    async def _request(self, method, url, **kwargs):
+        proxy = kwargs.pop('proxy', None)
+        timeout = kwargs.pop('timeout', DEFAULT_TIMEOUT)
+        await self._ensure_client(proxy)
+        used_proxy = proxy or self._proxy
+        try:
+            response = await self._client.request(
+                method,
+                url,
+                headers=dict(self.headers),
+                timeout=timeout,
+                **kwargs,
+            )
+        except RequestException as error:
+            raise NetworkError(_format_network_error(
+                error, method, url, used_proxy, timeout
+            )) from error
+        except OSError as error:
+            raise NetworkError(_format_network_error(
+                error, method, url, used_proxy, timeout
+            )) from error
+        return _HttpResponse(response)
+
+    def get(self, url, **kwargs):
+        return _RequestContext(self, 'GET', url, kwargs)
+
+    def post(self, url, **kwargs):
+        return _RequestContext(self, 'POST', url, kwargs)
+
+    def patch(self, url, **kwargs):
+        return _RequestContext(self, 'PATCH', url, kwargs)
+
+    async def close(self):
+        if self._client is not None:
+            await self._client.close()
+            self._client = None
+
+
+def _http_session(**kwargs):
+    return _HttpSession(headers=kwargs.get('headers'))
 
 # Define a custom exception
 class Cancelled(Exception):
@@ -225,18 +546,38 @@ class Creator:
         elif type == 'dsc_r':
             return ''.join(random.choices(string.ascii_letters.upper() + string.digits + string.ascii_letters, k=8))
 
+    def _reuse_ip(self, account, config=None):
+        if config and config.get('proxy_flush'):
+            return False
+        data = account.get('data') or account
+        return data.get('reuse_ip', account.get('reuse_ip', True))
+
+    def apply_proxy_flush(self, accounts):
+        updated = 0
+        for account in accounts:
+            data = account.get('data') or {}
+            if not data.get('proxies'):
+                continue
+            success, msg = self.update(account, {'reuse_ip': False})
+            if success:
+                account['data']['reuse_ip'] = False
+                updated += 1
+            else:
+                Utils.write_log(msg)
+        return updated
+
     async def update_media_id(self, post_id, creator, creator_id):
-        async with _aiohttp_session(headers=creator.get('data', {}).get('headers')) as session:
+        async with _http_session(headers=creator.get('data', {}).get('headers')) as session:
             session.headers.update({'user-agent': Utils.generate_user_agent('android', 1)})
             proxies = Utils.format_proxy(random.choice(self.proxies)) if not creator.get('reuse_ip') else creator.get('proxies')
             try:
                 async with session.get(
                     f'https://api.maloum.com/posts/{post_id}',
                     proxy=proxies,
-                    timeout=20
+                    timeout=90
                 ) as response:
                     if not response.ok:
-                        raise Exception(f'Error fetching media ID for {post_id}: {await response.text()}')
+                        raise Exception(await _http_failure(response, f'Fetch media ID for {post_id}'))
                     media = (await response.json()).get('media', [])
                     if not media:
                         raise Exception(f'No media ID found for {post_id}')
@@ -252,6 +593,9 @@ class Creator:
 
     async def scrape_users(self, scraper, admin, task_id, count=50, limit=50, offset=0, last_activity=7):
         try:
+            if not isinstance(scraper, dict) or not scraper.get('id'):
+                return False, f'Scraper is not logged in: {scraper}'
+
             success, task_status = Utils.check_task_status(task_id)
             if not success:
                 raise Exception(task_status)
@@ -261,10 +605,11 @@ class Creator:
             client_msg = {'msg': f'Scraping users by {scraper["id"]}', 'status': 'success', 'type': 'message'}
             success, msg = Utils.update_client(client_msg)
 
+            auth_headers = scraper.get('headers') or {}
             headers = {
                 'accept': 'application/json',
                 'accept-language': 'en-US,en;q=0.9',
-                'authorization': scraper.get('headers').get('authorization'),
+                'authorization': auth_headers.get('authorization'),
                 'origin': 'https://app.maloum.com',
                 'priority': 'u=1, i',
                 'referer': 'https://app.maloum.com/',
@@ -277,7 +622,7 @@ class Creator:
                 'user-agent': Utils.generate_user_agent('android', 1),
             }
 
-            async with _aiohttp_session(headers=headers) as session:
+            async with _http_session(headers=headers) as session:
                 # session.cookie_jar.update_cookies(scraper.get('cookies'))
                 proxies = scraper.get('proxies', Utils.format_proxy(random.choice(self.proxies))) \
                     if scraper.get('reuse_ip', True) else Utils.format_proxy(random.choice(self.proxies))
@@ -296,10 +641,10 @@ class Creator:
                     'https://api.maloum.com/users/current/preferences',
                     json=json_data,
                     proxy=proxies,
-                    timeout=60
+                    timeout=120
                 ) as response:
                     if not response.ok:
-                        raise Exception(f'Error setting preferences: {await response.text()}')
+                        raise Exception(await _http_failure(response, 'Set preferences'))
                     client_msg = {'msg': f'Category preferences set to {cat.get('name')}', 'status': 'success', 'type': 'message'}
                     Utils.update_client(client_msg)
 
@@ -309,10 +654,10 @@ class Creator:
                     'https://api.maloum.com/content/discovery',
                     params={'limit': f'30', 'dsc_r': self.generate_sensor_data('dsc_r')},
                     proxy=proxies,
-                    timeout=20
+                    timeout=90
                 ) as response:
                     if not response.ok:
-                        raise Exception(f'Could not get posts: {await response.text()}')
+                        raise Exception(await _http_failure(response, 'Get discovery posts'))
                     posts = (await response.json()).get('data', [])
 
                 total_creators = 0
@@ -398,12 +743,10 @@ class Creator:
                                     f'https://api.maloum.com/posts/{post_id}/comments',
                                     params=params,
                                     proxy=proxies,
-                                    timeout=60
+                                    timeout=120
                                 ) as response:
                                     if not response.ok:
-                                        raise Exception(
-                                            f'could not get comment for post | {post_id} | {await response.text()}'
-                                        )
+                                        raise Exception(await _http_failure(response, f'Get comments for post {post_id}'))
 
                                     data = await response.json()
                                     comments, _next = data.get('data', []), data.get('next')
@@ -481,7 +824,7 @@ class Creator:
             password = creator['data']['details']['user']['password']
 
             success, _creator = await self.login(
-                admin, email, password, reuse_ip=creator.get('reuse_ip', True), task_id=task_id
+                admin, email, password, reuse_ip=self._reuse_ip(creator, config), task_id=task_id
             )
             if not success:
                 raise Exception(_creator)
@@ -516,7 +859,7 @@ class Creator:
 
             Utils.write_log(f"--- Fetching users from DB (unmessaged by {creator_name}) offset {offset} ---")
 
-            async with _aiohttp_session() as session:
+            async with _http_session() as session:
                 session.headers.update(creator_data.get('headers'))
                 session.headers.update(self._trace_headers())
                 session.cookie_jar.update_cookies(creator_data.get('cookies'))
@@ -570,17 +913,17 @@ class Creator:
                             'https://api.maloum.com/chats',
                             json={'member2': recipient_id},
                             proxy=proxies,
-                            timeout=20
+                            timeout=90
                         ) as response:
                             if not response.ok:
-                                err_text = await response.text()
-                                Utils.write_log(f"--- Failed to create chat for user {username}: {err_text} ---")
+                                err_text = await _http_failure(response, f'Create chat for {username}')
+                                Utils.write_log(f"--- {err_text} ---")
                                 if response.status == 404:
                                     client_msg = {'msg': f"This user {username} no longer exists, skipping it", 'status': 'success', 'type': 'message'}
                                     success, msg = Utils.update_user(recipient_id, 'inactive')
                                     if not success:Utils.write_log(f"--- Failed to mark user {username} as inactive: {msg} ---")
                                 else:
-                                    client_msg = {'msg': f"Failed to create chat for user {username}: {err_text}", 'status': 'error', 'type': 'message'}
+                                    client_msg = {'msg': err_text, 'status': 'error', 'type': 'message'}
                                 success, msg = Utils.update_client(client_msg)
                                 continue
                             
@@ -612,10 +955,10 @@ class Creator:
                             f'https://api.maloum.com/chats/{chat_id}/messages',
                             params={'limit': 50},   # fetch enough to find the creator's last msg
                             proxy=proxies,
-                            timeout=20
+                            timeout=90
                         ) as response:
                             if not response.ok:
-                                Utils.write_log(f"--- Failed to check messages for chat {chat_id}: {await response.text()} ---")
+                                Utils.write_log(f"--- {await _http_failure(response, f'Check messages for chat {chat_id}')} ---")
                                 continue
                             
                             data = await response.json()
@@ -700,10 +1043,10 @@ class Creator:
                             f'https://api.maloum.com/chats/{chat_id}/messages',
                             json=json_data,
                             proxy=proxies,
-                            timeout=20
+                            timeout=90
                         ) as response:
                             if not response.ok:
-                                Utils.write_log(f"--- Failed to send message for chat {chat_id}: {await response.text()} ---")
+                                Utils.write_log(f"--- {await _http_failure(response, f'Send message for chat {chat_id}')} ---")
                                 continue
                             
                         # Add message to db via Utils.add_message
@@ -756,7 +1099,23 @@ class Creator:
 
 
     async def login(self, admin, email, password, reuse_ip=True, task_id=None, category='creators'):
-        async with _aiohttp_session() as session:
+        attempts = 3
+        last_error = None
+        for attempt in range(1, attempts + 1):
+            success, result = await self._try_login(
+                admin, email, password, reuse_ip=reuse_ip, task_id=task_id, category=category
+            )
+            if success:
+                return success, result
+            last_error = result
+            if not _is_retryable_error(result) or attempt == attempts:
+                return False, result
+            Utils.write_log(f'Retrying login for {email} ({attempt}/{attempts}): {result}')
+            await asyncio.sleep(min(2 * attempt, 5))
+        return False, last_error
+
+    async def _try_login(self, admin, email, password, reuse_ip=True, task_id=None, category='creators'):
+        async with _http_session() as session:
             try:
                 success, task_status = Utils.check_task_status(task_id) if task_id else (False, 'No task ID provided')
                 if not success:
@@ -792,10 +1151,13 @@ class Creator:
                         params={'grant_type': 'refresh_token'},
                         json={'refresh_token': refresh_token},
                         proxy=proxies,
-                        timeout=60
+                        timeout=120
                     ) as response:
                         if not response.ok:
-                            Utils.write_log(f'could not refresh access token with refresh token {refresh_token} {await response.text()} moving on with proper login')
+                            Utils.write_log(
+                                f'could not refresh access token for {email}: '
+                                f'{await _http_failure(response, "token refresh")}; moving on with proper login'
+                            )
                         
                         else:
                             login_data = await response.json()
@@ -835,16 +1197,13 @@ class Creator:
                     'https://api.maloum.com/user-management/login',
                     json={'usernameOrEmail': email, 'password': password},
                     proxy=proxies,
-                    timeout=60
+                    timeout=120
                 ) as response:
                     if response.status == 401:
                         return False, 'Credentials not correct'
                     if not response.ok:
                         user_data['status'] = 'Offline'
-                        body = await response.text()
-                        if body.lstrip().startswith('<') or 'Just a moment' in body:
-                            return False, 'Maloum blocked login with a Cloudflare challenge. Try another proxy.'
-                        return False, body[:500]
+                        return False, await _http_failure(response, f'Login for {email}')
 
                     login_data = await self._response_json(response)
                     token, refresh_token = login_data['accessToken'], login_data['refreshToken']
@@ -858,19 +1217,19 @@ class Creator:
                     async with session.get(
                         'https://srswgacczfgjttwdpuia.supabase.co/auth/v1/user',
                         proxy=proxies,
-                        timeout=60
+                        timeout=120
                     ) as response:
                         if not response.ok:
-                            raise Exception('Could not get user account creds')
+                            raise Exception(await _http_failure(response, 'Fetch account credentials'))
                         login_state = await response.json()
 
                     async with session.get(
                         'https://api.maloum.com/users/current',
                         proxy=proxies,
-                        timeout=60
+                        timeout=120
                     ) as response:
                         if not response.ok:
-                            raise Exception('Could not get user current creds')
+                            raise Exception(await _http_failure(response, 'Fetch current user'))
                         account = await response.json()
 
                     profile = {}
@@ -878,10 +1237,10 @@ class Creator:
                         async with session.get(
                             f'https://api.maloum.com/users/{account["username"]}/profile',
                             proxy=proxies,
-                            timeout=60
+                            timeout=120
                         ) as response:
                             if not response.ok:
-                                raise Exception('Could not get user profile details')
+                                raise Exception(await _http_failure(response, 'Fetch user profile'))
                             profile = await response.json()
 
                     data = {
@@ -920,10 +1279,13 @@ class Creator:
                     await session.close()
                     return True, user_data
 
+            except NetworkError as e:
+                Utils.write_log(f'Login network error on {email}: {e}')
+                return False, f'Login failed for {email}: {e}'
             except Exception as e:
                 tb = traceback.format_exc()
-                Utils.write_log(f'Error in login {e} on {email}')
-                return False, f'Error in login {e} on {email} {e.__class__.__name__}: {str(e)}\n{tb}'
+                Utils.write_log(f'Error in login {e} on {email}\n{tb}')
+                return False, f'Error in login on {email}: {e}'
             
     def update(self,user:dict,data:dict):
         try:
@@ -1058,6 +1420,12 @@ class _MALOUM:
                         raise Exception(msg)
                     scrapers.extend(msg)
 
+            if config.get('proxy_flush'):
+                flushed = Creator().apply_proxy_flush(creators) + Creator().apply_proxy_flush(scrapers)
+                Utils.write_log(f'Proxy flush enabled: reuse_ip disabled for {flushed} accounts with stored proxies')
+                client_msg = {'msg': f'Proxy flush enabled: reuse_ip disabled for {flushed} accounts with stored proxies', 'status': 'success', 'type': 'message'}
+                Utils.update_client(client_msg)
+
             Utils.write_log(f'=== Messaging started for {task_id} ===')
 
             while True:
@@ -1073,7 +1441,14 @@ class _MALOUM:
                 ]
                 results = await asyncio.gather(*tasks, return_exceptions=True)
 
-                for success, result in results:
+                for item in results:
+                    if isinstance(item, Exception):
+                        success, result = False, str(item)
+                    elif isinstance(item, (tuple, list)) and len(item) == 2:
+                        success, result = item
+                    else:
+                        success, result = False, str(item)
+
                     if not success:
                         client_msg = {'msg': f'Error messaging users on {task_id}: {result}', 'status': 'error', 'type': 'message'}
                         success, msg = Utils.update_client(client_msg)
@@ -1163,6 +1538,12 @@ class _MALOUM:
                     if not success: raise Exception(msg)
                     scrapers.extend(msg)
 
+            if config.get('proxy_flush'):
+                flushed = Creator().apply_proxy_flush(scrapers)
+                Utils.write_log(f'Proxy flush enabled: reuse_ip disabled for {flushed} accounts with stored proxies')
+                client_msg = {'msg': f'Proxy flush enabled: reuse_ip disabled for {flushed} accounts with stored proxies', 'status': 'success', 'type': 'message'}
+                Utils.update_client(client_msg)
+
             Utils.write_log(f'=== Scraping started for {task_id} ===')
 
             offset, i = 0, 0
@@ -1177,14 +1558,24 @@ class _MALOUM:
                     break
                 
                 target_scraper = scrapers[i]
+                email = target_scraper.get('email') or target_scraper.get('id')
                 success, scraper = await Creator().login(
                     admin, 
                     target_scraper['email'], 
                     target_scraper['data']['details']['user']['password'],
-                    reuse_ip=target_scraper.get('reuse_ip', True), 
+                    reuse_ip=Creator()._reuse_ip(target_scraper, config), 
                     task_id=task_id, 
                     category='users'
                 )
+
+                if not success:
+                    result = scraper if isinstance(scraper, str) else f'Login failed for {email}'
+                    client_msg = {'msg': f'Error scraping users on {task_id}: {result}', 'status': 'error', 'type': 'message'}
+                    Utils.update_client(client_msg)
+                    Utils.write_log(f'=== {result} ===')
+                    i = i + 1 if i < len(scrapers) - 1 else 0
+                    await asyncio.sleep(5)
+                    continue
 
                 success, result = await Creator().scrape_users(
                     scraper, 

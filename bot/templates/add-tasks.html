@@ -118,7 +118,18 @@
                             <input type="number" id="max-actions" name="max-actions" value="10" max="50" autofocus tocomplete="delay" required>
                             <label for="max-actions">Number of messages per interation</label>
                         </div>
-                        <div class="input-container">
+                        <div class="input-container flex radio">
+                            <span style="padding: 0; margin: 0 auto 0 0;">
+                                Proxy flush
+                            </span>
+                            <div class="radio-box">
+                                <input type="radio" class="proxy-flush" id="proxy-flush-yes" name="proxy-flush" value="yes">
+                                <label for="proxy-flush-yes">Yes</label>
+                            </div>
+                            <div class="radio-box">
+                                <input type="radio" class="proxy-flush" id="proxy-flush-no" name="proxy-flush" value="no" checked>
+                                <label for="proxy-flush-no">No</label>
+                            </div>
                         </div>
                     </div>
                     <div class="message-holder">
@@ -344,7 +355,18 @@
                             <input type="number" id="last-activity" name="last-activity" value="7" max="30" autofocus tocomplete="delay" required>
                             <label for="last-activity">Number of days since user's comment</label>
                         </div>
-                        <div class="input-container">
+                        <div class="input-container flex radio">
+                            <span style="padding: 0; margin: 0 auto 0 0;">
+                                Proxy flush
+                            </span>
+                            <div class="radio-box">
+                                <input type="radio" class="proxy-flush" id="scraper-proxy-flush-yes" name="proxy-flush" value="yes">
+                                <label for="scraper-proxy-flush-yes">Yes</label>
+                            </div>
+                            <div class="radio-box">
+                                <input type="radio" class="proxy-flush" id="scraper-proxy-flush-no" name="proxy-flush" value="no" checked>
+                                <label for="scraper-proxy-flush-no">No</label>
+                            </div>
                         </div>
                     </div>
                     <div class="input-container flex">

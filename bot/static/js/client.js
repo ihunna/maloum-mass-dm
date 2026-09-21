@@ -82,12 +82,22 @@ const updateClient = (data) => {
         if (!_console) return;
 
         const li = document.createElement("li");
-        li.innerHTML = data.msg;
+        const rawMsg = String(data.msg ?? '');
+        li.innerHTML = rawMsg
+            .replace(/(?:<br\s*\/?>\s*){3,}/gi, '<br><br>')
+            .replace(/(\r?\n[ \t]*){3,}/g, '\n\n')
+            .trim();
         li.classList.add(data.status);
-        _console.appendChild(li);
 
         const scroller = _console.parentElement;
-        scroller.scrollTop = scroller.scrollHeight;
+        const stickToBottom = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 48;
+        _console.appendChild(li);
+
+        if (stickToBottom) {
+            requestAnimationFrame(() => {
+                scroller.scrollTop = scroller.scrollHeight;
+            });
+        }
     }
 }
 

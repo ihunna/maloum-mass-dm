@@ -580,7 +580,8 @@ def handle_messages():
             'has_media': True if data.get('use-media', 'false').lower() == 'yes' else False,
             'media_id': data.get('media-id'),
             'admin': admin,
-            'time_between': int(data.get('time-between-actions', '3600'))
+            'time_between': int(data.get('time-between-actions', '3600')),
+            'proxy_flush': True if str(data.get('proxy-flush', 'no')).lower() == 'yes' else False
         }
 
         task_id = str(uuid.uuid4()).upper()[:8]
@@ -655,7 +656,8 @@ def scraper():
                 'admin': admin,
                 'time_between': int(data.get('time-between-actions', '3600')),
                 'last_activity': int(data.get('last-activity','7')),
-                'max_actions':int(data.get('max-actions', 10))
+                'max_actions':int(data.get('max-actions', 10)),
+                'proxy_flush': True if str(data.get('proxy-flush', 'no')).lower() == 'yes' else False
             }
 
             task_id = str(uuid.uuid4()).upper()[:8]

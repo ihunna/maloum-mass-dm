@@ -5,7 +5,7 @@
             <div class="title">
                 Console update
             </div>
-            <div class="content scroll scroll-v">
+            <div class="content scroll scroll-v scroll-bar">
                 <ul id="console">
                    
                 </ul>
@@ -87,6 +87,13 @@
             const _console = document.getElementById("console");
             _console.innerHTML = '';
         })
+
+        const consoleScroller = document.querySelector('#aside > .content');
+        if (consoleScroller) {
+            consoleScroller.addEventListener('wheel', (event) => {
+                event.stopPropagation();
+            }, { passive: true });
+        }
 
         const logoutBtn = document.getElementById('logout');
         logoutBtn.addEventListener('click', async () => {

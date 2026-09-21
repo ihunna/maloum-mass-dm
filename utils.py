@@ -32,10 +32,12 @@ class Utils:
                     
                 proxies.append(proxy)
 
-        return [{
-            'http': 'http://127.0.0.1:8080',
-            'https': 'http://127.0.0.1:8080'
-        }]
+        if os.getenv('MITMWEB', '1').strip().lower() not in ('0', 'false', 'no'):
+            return [{
+                'http': 'http://127.0.0.1:8080',
+                'https': 'http://127.0.0.1:8080'
+            }]
+        return proxies
     
     @staticmethod
     def get_proxy_cert(proxy_cert):
