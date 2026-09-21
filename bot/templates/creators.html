@@ -87,6 +87,11 @@
                     {%endfor%}
                     <div class="table-row table-bottom">
                             <div class="bottom-actions show">
+                                <div data-action="reset offset for" data-action-url="{{ url_for('handle_creators', action='reset-offset') }}"
+                                    data-action-message="Resetting creator offsets"
+                                    class="action bg-primary light" onclick="event.stopPropagation(); handleAction(this,'creators-table','multiple')">
+                                    Reset offset
+                                </div>
                                 <div data-action="delete" data-action-url="{{ url_for('delete', category='creators') }}" 
                                     data-action-message="Deleting creators" 
                                     class="action delete bg-danger light" onclick="handleAction(this,'creators-table','multiple')">
