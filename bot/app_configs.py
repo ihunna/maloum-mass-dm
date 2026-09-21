@@ -57,7 +57,7 @@ load_dotenv(env_path)
 session_key = os.getenv('SECRET_KEY')
 server_key = os.getenv('SERVER_KEY')
 host = os.getenv('HOST')
-app_prefix = os.getenv('APP_PREFIX') or ''
+app_prefix = (os.getenv('APP_PREFIX') or '').rstrip('/')
 app_name = os.getenv('APP_NAME') or 'Maloum'
 app_logo = os.getenv('APP_LOGO') or 'img/logo.png'
 
@@ -86,6 +86,10 @@ app.config["SESSION_FILE_DIR"] = os.path.join(parent_folder, ".flask_sessions")
 os.makedirs(app.config["SESSION_FILE_DIR"], exist_ok=True)
 app.config["SECRET_KEY"] = session_key.encode()
 app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(days=7)
+app.config["SESSION_COOKIE_NAME"] = os.getenv('SESSION_COOKIE_NAME') or 'maloum_session'
+if app_prefix:
+    app.config["APPLICATION_ROOT"] = app_prefix
+    app.config["SESSION_COOKIE_PATH"] = app_prefix
 Session(app)
 
 
