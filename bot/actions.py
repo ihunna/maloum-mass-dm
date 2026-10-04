@@ -1,7 +1,7 @@
 from app_configs import creators_file,configs_folder,universal_files
 from utils import Utils
 from configs import *
-import io, threading, socketio, asyncio, traceback
+import io, threading, socketio, asyncio, traceback, base64
 from urllib.parse import urlparse
 from curl_cffi.requests import AsyncSession
 from curl_cffi.requests.exceptions import RequestException
@@ -35,6 +35,33 @@ DEFAULT_TIMEOUT = 120
 
 class NetworkError(Exception):
     """Retryable transport failure (timeout, proxy, TLS, reset)."""
+
+
+class SessionExpired(Exception):
+    """Maloum rejected the account's access token (HTTP 401)."""
+
+
+_session_locks = {}
+_session_locks_guard = threading.Lock()
+
+
+def _session_lock(key):
+    # Tasks run in separate threads with their own event loops, so an asyncio.Lock can't be shared.
+    with _session_locks_guard:
+        return _session_locks.setdefault(key, threading.Lock())
+
+
+def _auth_token(headers):
+    return (headers or {}).get('authorization') or (headers or {}).get('Authorization')
+
+
+def _token_unexpired(authorization, margin=60):
+    try:
+        payload = str(authorization).split(' ')[-1].split('.')[1]
+        payload += '=' * (-len(payload) % 4)
+        return json.loads(base64.urlsafe_b64decode(payload)).get('exp', 0) > time.time() + margin
+    except Exception:
+        return True
 
 
 def _redact_proxy(proxy):
@@ -643,6 +670,8 @@ class Creator:
                     proxy=proxies,
                     timeout=120
                 ) as response:
+                    if response.status == 401:
+                        raise SessionExpired(await _http_failure(response, 'Set preferences'))
                     if not response.ok:
                         raise Exception(await _http_failure(response, 'Set preferences'))
                     client_msg = {'msg': f'Category preferences set to {cat.get('name')}', 'status': 'success', 'type': 'message'}
@@ -656,6 +685,8 @@ class Creator:
                     proxy=proxies,
                     timeout=90
                 ) as response:
+                    if response.status == 401:
+                        raise SessionExpired(await _http_failure(response, 'Get discovery posts'))
                     if not response.ok:
                         raise Exception(await _http_failure(response, 'Get discovery posts'))
                     posts = (await response.json()).get('data', [])
@@ -805,9 +836,134 @@ class Creator:
                     return False, f'No valid users found for {scraper["id"]}'
                 return True, f'Scraped {len(valid_users)} users by {scraper["id"]}'
 
+        except SessionExpired:
+            raise
         except Exception as e:
             return False, f'Error scraping users: {e}'
 
+
+    async def _find_chat_list(self, session, name, proxies):
+        next_offset = None
+        while True:
+            params = {'limit': 25}
+            if next_offset is not None:params['next'] = next_offset
+            async with session.get('https://api.maloum.com/chat-lists', params=params, proxy=proxies, timeout=60) as response:
+                if response.status == 401:
+                    raise SessionExpired(await _http_failure(response, 'Fetch chat lists'))
+                if not response.ok:
+                    return False, await _http_failure(response, 'Fetch chat lists')
+                body = await response.json()
+            for chat_list in body.get('data', []):
+                if not chat_list.get('isManaged') and str(chat_list.get('name', '')).strip().lower() == name.lower():
+                    return True, chat_list
+            next_offset = body.get('next')
+            if next_offset is None or not body.get('data'):
+                return True, None
+
+    async def sync_all_list(self, session, creator, creator_name, proxies, list_name='All', list_tag='all'):
+        try:
+            success, chat_list = await self._find_chat_list(session, list_name, proxies)
+            if not success:return False, chat_list
+
+            if chat_list is None:
+                async with session.post(
+                    'https://api.maloum.com/chat-lists',
+                    json={'name': list_name, 'tag': list_tag},
+                    proxy=proxies,
+                    timeout=60
+                ) as response:
+                    if response.status == 401:
+                        raise SessionExpired(await _http_failure(response, f'Create "{list_name}" list for {creator_name}'))
+                    if not response.ok:
+                        return False, await _http_failure(response, f'Create "{list_name}" list for {creator_name}')
+                    chat_list = await response.json()
+                Utils.write_log(f'--- Created "{list_name}" list for {creator_name} ---')
+
+            list_id = chat_list.get('_id')
+            if not list_id:return False, f'No ID returned for "{list_name}" list of {creator_name}'
+
+            # a different list (e.g. deleted and recreated on Maloum) means nobody is in it yet
+            if creator.get('data', {}).get('all_list_id') != list_id:
+                success, msg = Utils.mark_recipients_listed(creator['id'], None, listed=0)
+                if not success:return False, msg
+                success, msg = self.update(creator, {'all_list_id': list_id})
+                if not success:return False, msg
+
+            success, recipient_ids = Utils.get_unlisted_recipients(creator['id'])
+            if not success:return False, recipient_ids
+            if not recipient_ids:
+                return True, f'"{list_name}" list of {creator_name} is up to date'
+
+            added = 0
+            for start in range(0, len(recipient_ids), 100):
+                chunk = recipient_ids[start:start + 100]
+                async with session.post(
+                    f'https://api.maloum.com/chat-lists/{list_id}/members',
+                    json={'add': chunk},
+                    proxy=proxies,
+                    timeout=60
+                ) as response:
+                    if response.status == 401:
+                        raise SessionExpired(await _http_failure(response, f'Add users to "{list_name}" list of {creator_name}'))
+                    if not response.ok:
+                        error = await _http_failure(response, f'Add users to "{list_name}" list of {creator_name}')
+                        return False, f'{error} (added {added} before failing)'
+                success, msg = Utils.mark_recipients_listed(creator['id'], chunk)
+                if not success:Utils.write_log(msg)
+                added += len(chunk)
+
+            return True, f'Added {added} users to "{list_name}" list of {creator_name}'
+        except SessionExpired:
+            raise
+        except Exception as e:
+            return False, f'Error syncing "{list_name}" list for {creator_name}: {e}'
+
+    async def sync_list(self, admin, task_id, creator, config):
+        try:
+            success, task_status = Utils.check_task_status(task_id)
+            if not success:raise Exception(task_status)
+            if task_status['status'].lower() in ['cancelled', 'canceled']:
+                return False, 'Task canceled'
+
+            if not creator.get('data', {}):
+                raise Exception('creator data not available')
+
+            email = creator['data']['details']['user']['email']
+            password = creator['data']['details']['user']['password']
+
+            success, creator_data = await self.login(
+                admin, email, password, reuse_ip=self._reuse_ip(creator, config), task_id=task_id
+            )
+            if not success:raise Exception(creator_data)
+            creator_name = creator_data['details']['user']['username']
+
+            async with _http_session() as session:
+                session.headers.update(creator_data.get('headers'))
+                session.headers.update(self._trace_headers())
+                session.cookie_jar.update_cookies(creator_data.get('cookies'))
+                proxies = creator_data.get('proxies', Utils.format_proxy(random.choice(self.proxies))) if creator_data.get('reuse_ip', True) else Utils.format_proxy(random.choice(self.proxies))
+
+                list_args = (config.get('list_name') or 'All', config.get('list_tag') or 'all')
+                try:
+                    return await self.sync_all_list(session, creator, creator_name, proxies, *list_args)
+                except SessionExpired as e:
+                    Utils.write_log(f'--- Session for {creator_name} expired, refreshing: {e} ---')
+                    success, refreshed = await self.login(
+                        admin, email, password, reuse_ip=self._reuse_ip(creator, config),
+                        task_id=task_id, stale_token=_auth_token(session.headers)
+                    )
+                    if not success:
+                        return False, f'Could not refresh session for {creator_name}: {refreshed}'
+                    session.headers.update(refreshed.get('headers') or {})
+                    session.headers.update(self._trace_headers())
+                    session.cookie_jar.update_cookies(refreshed.get('cookies') or {})
+                    try:
+                        return await self.sync_all_list(session, creator, creator_name, proxies, *list_args)
+                    except SessionExpired as e:
+                        return False, f'Session for {creator_name} was rejected again after relogin: {e}'
+
+        except Exception as e:
+            return False, f'Error syncing list for {creator.get("id")}: {str(e)}'
 
     async def send_messages(self, admin, task_id, creator, scrapers, config, max_actions):
         try:
@@ -886,6 +1042,7 @@ class Creator:
 
                 success_messages = 0
                 backfilled_messages = 0
+                session_refreshed = False
 
                 random.shuffle(users)
 
@@ -920,6 +1077,8 @@ class Creator:
                             proxy=proxies,
                             timeout=90
                         ) as response:
+                            if response.status == 401:
+                                raise SessionExpired(await _http_failure(response, f'Create chat for {username}'))
                             if not response.ok:
                                 err_text = await _http_failure(response, f'Create chat for {username}')
                                 Utils.write_log(f"--- {err_text} ---")
@@ -967,6 +1126,8 @@ class Creator:
                             proxy=proxies,
                             timeout=90
                         ) as response:
+                            if response.status == 401:
+                                raise SessionExpired(await _http_failure(response, f'Check messages for chat {chat_id}'))
                             if not response.ok:
                                 Utils.write_log(f"--- {await _http_failure(response, f'Check messages for chat {chat_id}')} ---")
                                 continue
@@ -1055,6 +1216,8 @@ class Creator:
                             proxy=proxies,
                             timeout=90
                         ) as response:
+                            if response.status == 401:
+                                raise SessionExpired(await _http_failure(response, f'Send message for chat {chat_id}'))
                             if not response.ok:
                                 Utils.write_log(f"--- {await _http_failure(response, f'Send message for chat {chat_id}')} ---")
                                 continue
@@ -1091,6 +1254,22 @@ class Creator:
                         if success_messages >= max_actions:
                             break
 
+                    except SessionExpired as e:
+                        if session_refreshed:
+                            return False, f'Session for {creator_name} was rejected again after relogin: {e}'
+                        Utils.write_log(f'--- Session for {creator_name} expired, refreshing: {e} ---')
+                        success, refreshed = await self.login(
+                            admin, email, password, reuse_ip=self._reuse_ip(creator, config),
+                            task_id=task_id, stale_token=_auth_token(session.headers)
+                        )
+                        if not success:
+                            return False, f'Could not refresh session for {creator_name}: {refreshed}'
+                        session.headers.update(refreshed.get('headers') or {})
+                        session.headers.update(self._trace_headers())
+                        session.cookie_jar.update_cookies(refreshed.get('cookies') or {})
+                        session_refreshed = True
+                        continue
+
                     except Exception as e:
                         Utils.write_log(str(e))
                         client_msg = {'msg': f'Failed to message user {username}: {e}', 'status': 'error', 'type': 'message'}
@@ -1111,23 +1290,29 @@ class Creator:
             return False, f'Error sending messages to users for {creator.get("id")}: {str(e)}'
 
 
-    async def login(self, admin, email, password, reuse_ip=True, task_id=None, category='creators'):
-        attempts = 3
-        last_error = None
-        for attempt in range(1, attempts + 1):
-            success, result = await self._try_login(
-                admin, email, password, reuse_ip=reuse_ip, task_id=task_id, category=category
-            )
-            if success:
-                return success, result
-            last_error = result
-            if not _is_retryable_error(result) or attempt == attempts:
-                return False, result
-            Utils.write_log(f'Retrying login for {email} ({attempt}/{attempts}): {result}')
-            await asyncio.sleep(min(2 * attempt, 5))
-        return False, last_error
+    async def login(self, admin, email, password, reuse_ip=True, task_id=None, category='creators', stale_token=None):
+        lock = _session_lock(f'{admin}:{email}')
+        while not lock.acquire(blocking=False):
+            await asyncio.sleep(0.5)
+        try:
+            attempts = 3
+            last_error = None
+            for attempt in range(1, attempts + 1):
+                success, result = await self._try_login(
+                    admin, email, password, reuse_ip=reuse_ip, task_id=task_id, category=category, stale_token=stale_token
+                )
+                if success:
+                    return success, result
+                last_error = result
+                if not _is_retryable_error(result) or attempt == attempts:
+                    return False, result
+                Utils.write_log(f'Retrying login for {email} ({attempt}/{attempts}): {result}')
+                await asyncio.sleep(min(2 * attempt, 5))
+            return False, last_error
+        finally:
+            lock.release()
 
-    async def _try_login(self, admin, email, password, reuse_ip=True, task_id=None, category='creators'):
+    async def _try_login(self, admin, email, password, reuse_ip=True, task_id=None, category='creators', stale_token=None):
         async with _http_session() as session:
             try:
                 success, task_status = Utils.check_task_status(task_id) if task_id else (False, 'No task ID provided')
@@ -1149,6 +1334,28 @@ class Creator:
                 proxies = Utils.format_proxy(random.choice(self.proxies))
 
                 print(f'--- Logging in {email} with proxy {proxies} ---')
+
+                stored_token = _auth_token(user_data.get('headers'))
+                if not new_user and stale_token and stored_token and stored_token != stale_token:
+                    Utils.write_log(f'Session for {email} was already refreshed by another task, reusing it')
+                    user_data['id'] = creator_id
+                    return True, user_data
+
+                # reuse the stored session while its access token is still accepted
+                if not new_user and not stale_token and stored_token and _token_unexpired(stored_token):
+                    session.headers.update(user_data.get('headers', {}))
+                    session.headers.update(self._trace_headers())
+                    session.cookie_jar.update_cookies(user_data.get('cookies') or {})
+                    stored_proxies = user_data.get('proxies') or proxies
+                    async with session.get(
+                        'https://api.maloum.com/users/current',
+                        proxy=stored_proxies,
+                        timeout=60
+                    ) as response:
+                        if response.status == 200:
+                            user_data['id'] = creator_id
+                            return True, user_data
+                        Utils.write_log(f'Stored session for {email} rejected (HTTP {response.status}); refreshing token')
 
                 if not new_user:
                     session.headers.update(user_data.get('headers', {}))
@@ -1302,12 +1509,11 @@ class Creator:
             
     def update(self,user:dict,data:dict):
         try:
-            user_email,user_id,user = user['email'],user['id'],user['data']
-            for key,value in data.items():
-                user[key] = value
-            success,msg = Utils.update_creator(user_id,user_email,user)
-            if not success:raise Exception(msg)
-            return True,user
+            # merge into the stored record so a stale copy can't overwrite a refreshed session
+            success,merged = Utils.merge_creator_data(user['id'],data)
+            if not success:raise Exception(merged)
+            user['data'].update(data)
+            return True,merged
         except Exception as error:
             return False, error
     
@@ -1526,6 +1732,114 @@ class _MALOUM:
                 Utils.write_log(f'Task | {task_id} finished operation')
 
 
+    async def start_list_sync(self, task):
+        task_status, task_msg = 'failed', f'Started list sync for {task["id"]}'
+        task_id = task['id']
+        try:
+            admin = task['admin']
+            config = task['config']
+            selected_creators = config.get('selected_creators', [])
+            time_between = config.get('time_between', 3600)
+            time_message = {
+                '60': '1 minute', '120': '2 minutes', '180': '3 minutes', '300': '5 minutes',
+                '600': '10 minutes', '1200': '20 minutes', '1800': '30 minutes', '3600': '1 hour',
+                '7200': '2 hours', '10800': '3 hours', '21600': '6 hours', '86400': '24 hours'
+            }
+
+            success, creators, total_creators = Utils.get_creators(admin=admin, limit=100, selected_creators=selected_creators)
+            if not success:raise Exception(creators)
+            while len(creators) < total_creators:
+                success, page, total_creators = Utils.get_creators(admin=admin, limit=100, offset=len(creators), selected_creators=selected_creators)
+                if not success:raise Exception(page)
+                if not page:break
+                creators.extend(page)
+
+            if config.get('proxy_flush'):
+                flushed = Creator().apply_proxy_flush(creators)
+                Utils.write_log(f'Proxy flush enabled: reuse_ip disabled for {flushed} accounts with stored proxies')
+                Utils.update_client({'msg': f'Proxy flush enabled: reuse_ip disabled for {flushed} accounts with stored proxies', 'status': 'success', 'type': 'message'})
+
+            Utils.write_log(f'=== List sync started for {task_id} ===')
+
+            while True:
+                success, task_status = Utils.check_task_status(task_id)
+                if not success:raise Exception(task_status)
+                if task_status['status'].lower() in ['cancelled', 'canceled']:
+                    break
+
+                results = await asyncio.gather(
+                    *[Creator().sync_list(admin, task_id, creator, config) for creator in creators],
+                    return_exceptions=True
+                )
+
+                for item in results:
+                    if isinstance(item, Exception):
+                        success, result = False, str(item)
+                    elif isinstance(item, (tuple, list)) and len(item) == 2:
+                        success, result = item
+                    else:
+                        success, result = False, str(item)
+
+                    label = 'Lists' if success else 'Error syncing lists'
+                    Utils.update_client({'msg': f'{label} on {task_id}: {result}', 'status': 'success' if success else 'error', 'type': 'message'})
+                    Utils.write_log(f'=== {result} ===')
+
+                wait_message = f'Waiting for {time_message.get(str(time_between), f"{time_between} seconds")} before syncing lists again'
+                Utils.write_log(wait_message)
+                Utils.update_client({'msg': wait_message, 'status': 'success', 'type': 'message'})
+
+                sleep_time = 10
+                for _ in range(int(time_between / sleep_time)):
+                    success, task_status = Utils.check_task_status(task_id)
+                    if not success:raise Exception(task_status)
+                    if task_status['status'].lower() in ['cancelled', 'canceled']:
+                        raise Cancelled(task_status)
+                    await asyncio.sleep(sleep_time)
+
+        except Cancelled:
+            pass
+
+        except Exception as e:
+            Utils.write_log(e)
+            task_status = 'failed'
+            task_msg = f'Error in list sync | {task_id}: {e}'
+            Utils.update_client({'msg': task_msg, 'status': 'error', 'type': 'message'})
+            success, msg = Utils.update_task(task_id, {'status': task_status, 'message': task_msg})
+            task_data = task
+            task_data.update({'updated': str(datetime.now()), 'status': task_status})
+            success, msg = Utils.update_client({'task': task_data, 'type': 'task'})
+            if not success:Utils.write_log(msg)
+
+        finally:
+            task_status = task_status['status'] if isinstance(task_status, dict) else task_status
+            if task_status.lower() in ['cancelled', 'canceled']:
+                Utils.update_client({'msg': f'Task | {task_id} has been cancelled', 'status': 'error', 'type': 'message'})
+                Utils.write_log(f'Task | {task_id} was stopped')
+            else:
+                Utils.write_log(f'Task | {task_id} finished operation')
+
+    async def _scrape_with_refresh(self, admin, task_id, config, target_scraper, scraper, count, last_activity, offset):
+        try:
+            return await Creator().scrape_users(scraper, admin, task_id, count=count, last_activity=last_activity, offset=offset)
+        except SessionExpired as error:
+            email = target_scraper['email']
+            Utils.write_log(f'--- Session for {email} expired, refreshing: {error} ---')
+            success, scraper = await Creator().login(
+                admin,
+                email,
+                target_scraper['data']['details']['user']['password'],
+                reuse_ip=Creator()._reuse_ip(target_scraper, config),
+                task_id=task_id,
+                category='users',
+                stale_token=_auth_token(scraper.get('headers'))
+            )
+            if not success:
+                return False, f'Could not refresh session for {email}: {scraper}'
+            try:
+                return await Creator().scrape_users(scraper, admin, task_id, count=count, last_activity=last_activity, offset=offset)
+            except SessionExpired as error:
+                return False, f'Session for {email} was rejected again after relogin: {error}'
+
     async def start_scraping(self, task):
         task_status, task_msg = 'failed', f'Started scraping for {task["id"]}'
         try:
@@ -1590,13 +1904,9 @@ class _MALOUM:
                     await asyncio.sleep(5)
                     continue
 
-                success, result = await Creator().scrape_users(
-                    scraper, 
-                    admin, 
-                    task_id, 
-                    count = count,
-                    last_activity = last_activity,
-                    offset = offset)
+                success, result = await self._scrape_with_refresh(
+                    admin, task_id, config, target_scraper, scraper, count, last_activity, offset
+                )
 
                 if not success:
                     client_msg = {'msg': f'Error scraping users on {task_id}: {result}', 'status': 'error', 'type': 'message'}

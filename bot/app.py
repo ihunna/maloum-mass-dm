@@ -519,6 +519,13 @@ def messages():
                 captions = [caption for caption in f.readlines() if caption != '\n']
 
             return render_template('add-tasks.html', action=action, captions=captions, creators=creators)
+
+        elif action == 'sync-lists':
+            success, creators, total_creators = Utils.get_creators(admin=admin)
+            if not success:
+                raise Exception(creators)
+
+            return render_template('add-tasks.html', action=action, creators=creators)
         
         elif action == 'get-items':
             item = request.args.get('item')
@@ -657,6 +664,79 @@ def handle_messages():
                 Utils.write_log(msg)
             Utils.write_log(f'Task successfully created')
             return jsonify({'msg': f'Task successfully started'}), 200
+        else:
+            return jsonify({'msg': f'Could not start task {task_id}'}), 400
+
+    except Exception as error:
+        Utils.write_log(str(error))
+        abort(500)
+
+
+@app.route('/start-list-sync', methods=['POST'])
+@login_required
+def handle_list_sync():
+    try:
+        admin = session['USER']['id']
+
+        if len(Utils.load_proxies()) < 1:
+            return jsonify({'msg': 'Proxies must not be empty'}), 400
+
+        success, tasks, _ = Utils.get_tasks(admin=admin, constraint='type', keyword='lists')
+        if not success:
+            raise Exception(tasks)
+        running_task = tasks[0] if len(tasks) > 0 else {'status': None}
+
+        if running_task['status'] in ['running', 'pending']:
+            success, msg = Utils.update_client({
+                'msg': 'Please wait for the current list task to finish or stop it before creating another',
+                'status': 'error',
+                'type': 'message'
+            })
+            if not success:
+                Utils.write_log(msg)
+            return jsonify({'msg': 'A list task is already running. Please wait until it finishes.'}), 400
+
+        data = request.get_json()
+        list_data = {
+            'list_name': str(data.get('list-name') or '').strip() or 'All',
+            'list_tag': str(data.get('list-tag') or '').strip() or 'all',
+            'creators_source': data.get('creators-source'),
+            'selected_creators': data.get('select-creators', []),
+            'admin': admin,
+            'time_between': int(data.get('time-between-actions', '3600')),
+            'proxy_flush': True if str(data.get('proxy-flush', 'no')).lower() == 'yes' else False
+        }
+
+        task_id = str(uuid.uuid4()).upper()[:8]
+        task_data = {
+            'id': task_id,
+            'admin': admin,
+            'status': 'pending',
+            'action_count': 1,
+            'type': 'lists',
+            'message': f'Creating task on {admin}',
+            'config': list_data
+        }
+        success, msg = Utils.add_task(task_id, task_data)
+        if not success:
+            raise Exception(msg)
+
+        def run_list_sync():
+            run_async_coroutine(_MALOUM().start_list_sync(task_data))
+
+        task = socketio.start_background_task(run_list_sync)
+
+        if task.is_alive():
+            success, msg = Utils.update_task(task_id, {
+                'status': 'running',
+                'message': f'Started syncing "{list_data["list_name"]}" lists'
+            })
+            if not success:Utils.write_log(msg)
+
+            success, msg = Utils.update_client({'msg': f'Task {task_id} successfully created', 'status': 'success', 'type': 'message'})
+            if not success:
+                Utils.write_log(msg)
+            return jsonify({'msg': 'Task successfully started'}), 200
         else:
             return jsonify({'msg': f'Could not start task {task_id}'}), 400
 
