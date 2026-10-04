@@ -178,7 +178,6 @@ class Utils:
                     task_id TEXT DEFAULT NULL,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )''')
-            Utils._ensure_listed_column(cursor)
             
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS users (
@@ -764,44 +763,13 @@ class Utils:
             conn.close()
 
     @staticmethod
-    def _ensure_listed_column(cursor):
-        try:
-            cursor.execute('ALTER TABLE messages ADD COLUMN listed INTEGER DEFAULT 0')
-        except sqlite3.OperationalError as error:
-            if 'duplicate column' not in str(error).lower():raise
-
-    @staticmethod
-    def get_unlisted_recipients(creator_id):
+    def get_chat_recipient(chat_id):
         conn = sqlite3.connect(db_file)
         cursor = conn.cursor()
         try:
-            Utils._ensure_listed_column(cursor)
-            cursor.execute(
-                "SELECT DISTINCT recipient_id FROM messages WHERE creator_id = ? AND recipient_id IS NOT NULL AND COALESCE(listed, 0) = 0",
-                (creator_id,)
-            )
-            return True, [row[0] for row in cursor.fetchall()]
-        except Exception as error:
-            return False, str(error)
-        finally:
-            conn.close()
-
-    @staticmethod
-    def mark_recipients_listed(creator_id, recipient_ids, listed=1):
-        conn = sqlite3.connect(db_file)
-        cursor = conn.cursor()
-        try:
-            Utils._ensure_listed_column(cursor)
-            if recipient_ids is None:
-                cursor.execute("UPDATE messages SET listed = ? WHERE creator_id = ?", (listed, creator_id))
-            elif recipient_ids:
-                placeholders = ','.join('?' * len(recipient_ids))
-                cursor.execute(
-                    f"UPDATE messages SET listed = ? WHERE creator_id = ? AND recipient_id IN ({placeholders})",
-                    (listed, creator_id, *recipient_ids)
-                )
-            conn.commit()
-            return True, 'Recipients updated'
+            cursor.execute("SELECT recipient_id FROM messages WHERE id = ? LIMIT 1", (chat_id,))
+            row = cursor.fetchone()
+            return True, row[0] if row else None
         except Exception as error:
             return False, str(error)
         finally:

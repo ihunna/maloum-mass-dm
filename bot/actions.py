@@ -64,6 +64,23 @@ def _token_unexpired(authorization, margin=60):
         return True
 
 
+def _is_mitm_proxy(proxy):
+    if isinstance(proxy, dict):
+        proxy = proxy.get('http') or proxy.get('https')
+    host = urlparse(str(proxy or '')).hostname or ''
+    return host in ('127.0.0.1', 'localhost')
+
+
+def _parse_iso(value):
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace('Z', '+00:00'))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
 def _redact_proxy(proxy):
     if not isinstance(proxy, str) or not proxy:
         return proxy
@@ -361,6 +378,54 @@ class _HttpSession:
 def _http_session(**kwargs):
     return _HttpSession(headers=kwargs.get('headers'))
 
+
+class _Throttle:
+    """Paces requests to one Maloum endpoint group and backs off when it answers 429."""
+
+    def __init__(self, label, report=None, spacing=0.0, max_spacing=5.0):
+        self.label = label
+        self.report = report
+        self.spacing = spacing
+        self.max_spacing = max_spacing
+        self.until = 0.0
+        self.next_slot = 0.0
+        self.hits = 0
+        self._lock = asyncio.Lock()
+
+    async def wait(self):
+        loop = asyncio.get_running_loop()
+        async with self._lock:
+            now = loop.time()
+            start = max(now, self.until, self.next_slot)
+            self.next_slot = start + self.spacing
+        if start > now:
+            await asyncio.sleep(start - now)
+
+    def throttled(self, response):
+        now = asyncio.get_running_loop().time()
+        try:
+            retry_after = float(response.headers.get('retry-after') or 0)
+        except (TypeError, ValueError):
+            retry_after = 0
+        # Maloum's limits run in 5 second windows
+        pause = max(retry_after, 5.5)
+        self.hits += 1
+        if self.until <= now:
+            self.spacing = min(self.max_spacing, max(self.spacing * 1.5, 0.5))
+            if self.report:
+                self.report(f'Maloum is throttling {self.label}, pausing {pause:.0f}s')
+        self.until = max(self.until, now + pause)
+
+
+async def _throttled(throttle, session, method, url, attempts=6, **kwargs):
+    for _ in range(attempts):
+        await throttle.wait()
+        async with getattr(session, method)(url, **kwargs) as response:
+            if response.status != 429:
+                return response
+            throttle.throttled(response)
+    return response
+
 # Define a custom exception
 class Cancelled(Exception):
     """Custom exception for specific error handling."""
@@ -573,6 +638,12 @@ class Creator:
         elif type == 'dsc_r':
             return ''.join(random.choices(string.ascii_letters.upper() + string.digits + string.ascii_letters, k=8))
 
+    def _proxy(self, stored=None, reuse_ip=True):
+        # with mitmweb on, load_proxies() only returns mitmweb; with it off, a stored mitmweb address is stale
+        if reuse_ip and stored and not _mitmweb_enabled() and not _is_mitm_proxy(stored):
+            return Utils.format_proxy(stored) if isinstance(stored, dict) else stored
+        return Utils.format_proxy(random.choice(self.proxies))
+
     def _reuse_ip(self, account, config=None):
         if config and config.get('proxy_flush'):
             return False
@@ -596,7 +667,7 @@ class Creator:
     async def update_media_id(self, post_id, creator, creator_id):
         async with _http_session(headers=creator.get('data', {}).get('headers')) as session:
             session.headers.update({'user-agent': Utils.generate_user_agent('android', 1)})
-            proxies = Utils.format_proxy(random.choice(self.proxies)) if not creator.get('reuse_ip') else creator.get('proxies')
+            proxies = self._proxy(creator.get('data', {}).get('proxies'), creator.get('data', {}).get('reuse_ip', True))
             try:
                 async with session.get(
                     f'https://api.maloum.com/posts/{post_id}',
@@ -651,8 +722,7 @@ class Creator:
 
             async with _http_session(headers=headers) as session:
                 # session.cookie_jar.update_cookies(scraper.get('cookies'))
-                proxies = scraper.get('proxies', Utils.format_proxy(random.choice(self.proxies))) \
-                    if scraper.get('reuse_ip', True) else Utils.format_proxy(random.choice(self.proxies))
+                proxies = self._proxy(scraper.get('proxies'), scraper.get('reuse_ip', True))
 
                 #Set random preferences
                 cat = random.choice(self.categories)
@@ -860,8 +930,13 @@ class Creator:
             if next_offset is None or not body.get('data'):
                 return True, None
 
-    async def sync_all_list(self, session, creator, creator_name, proxies, list_name='All', list_tag='all'):
+    async def sync_all_list(self, session, creator, creator_name, own_user_id, proxies, list_name='All', list_tag='all', task_id=None):
+        def report(msg):
+            Utils.write_log(f'--- {msg} ---')
+            Utils.update_client({'msg': msg, 'status': 'success', 'type': 'message'})
+
         try:
+            report(f'Looking for "{list_name}" list of {creator_name}')
             success, chat_list = await self._find_chat_list(session, list_name, proxies)
             if not success:return False, chat_list
 
@@ -877,46 +952,144 @@ class Creator:
                     if not response.ok:
                         return False, await _http_failure(response, f'Create "{list_name}" list for {creator_name}')
                     chat_list = await response.json()
-                Utils.write_log(f'--- Created "{list_name}" list for {creator_name} ---')
+                report(f'Created "{list_name}" list for {creator_name}')
+            else:
+                report(f'Found "{list_name}" list of {creator_name} ({chat_list.get("totalMemberCount", 0)} members)')
 
             list_id = chat_list.get('_id')
             if not list_id:return False, f'No ID returned for "{list_name}" list of {creator_name}'
 
-            # a different list (e.g. deleted and recreated on Maloum) means nobody is in it yet
-            if creator.get('data', {}).get('all_list_id') != list_id:
-                success, msg = Utils.mark_recipients_listed(creator['id'], None, listed=0)
-                if not success:return False, msg
-                success, msg = self.update(creator, {'all_list_id': list_id})
-                if not success:return False, msg
+            # chats are ordered by latest activity, so after one complete pass
+            # only chats active since the previous pass can be missing from the list
+            sync_state = dict(creator.get('data', {}).get('list_sync') or {})
+            last_synced = _parse_iso(sync_state.get(list_id))
+            cutoff = last_synced - timedelta(minutes=15) if last_synced else None
+            started_at = datetime.now(timezone.utc).isoformat()
+            if cutoff:
+                report(f'Getting chat users of {creator_name} active since {cutoff.strftime("%Y-%m-%d %H:%M")} UTC')
+            else:
+                report(f'Getting all chat users of {creator_name} (full scan, this can take a while)')
 
-            success, recipient_ids = Utils.get_unlisted_recipients(creator['id'])
-            if not success:return False, recipient_ids
-            if not recipient_ids:
-                return True, f'"{list_name}" list of {creator_name} is up to date'
+            pending, seen, added, scanned, unresolved = [], set(), 0, 0, 0
+            lookup_slots = asyncio.Semaphore(2)
+            throttle = _Throttle(f'chat lookups for {creator_name}', report=report, spacing=1.0)
+            member_count = chat_list.get('totalMemberCount', 0)
 
-            added = 0
-            for start in range(0, len(recipient_ids), 100):
-                chunk = recipient_ids[start:start + 100]
+            async def refresh_member_count():
+                nonlocal member_count
+                async with session.get(f'https://api.maloum.com/chat-lists/{list_id}', proxy=proxies, timeout=60) as response:
+                    if response.status == 401:
+                        raise SessionExpired(await _http_failure(response, f'Fetch "{list_name}" list of {creator_name}'))
+                    if response.ok:
+                        member_count = (await response.json()).get('totalMemberCount', member_count)
+
+            async def resolve(chat):
+                async with lookup_slots:
+                    return await self._chat_partner_id(session, chat, own_user_id, proxies, throttle)
+
+            async def flush():
+                nonlocal pending, added
+                if not pending:return
                 async with session.post(
                     f'https://api.maloum.com/chat-lists/{list_id}/members',
-                    json={'add': chunk},
+                    json={'add': pending},
                     proxy=proxies,
                     timeout=60
                 ) as response:
                     if response.status == 401:
                         raise SessionExpired(await _http_failure(response, f'Add users to "{list_name}" list of {creator_name}'))
                     if not response.ok:
-                        error = await _http_failure(response, f'Add users to "{list_name}" list of {creator_name}')
-                        return False, f'{error} (added {added} before failing)'
-                success, msg = Utils.mark_recipients_listed(creator['id'], chunk)
-                if not success:Utils.write_log(msg)
-                added += len(chunk)
+                        raise RuntimeError(f'{await _http_failure(response, f"Add users to {list_name} list of {creator_name}")} (added {added} before failing)')
+                batch = len(pending)
+                added += batch
+                pending = []
+                await refresh_member_count()
+                report(f'+{batch} added to "{list_name}" list of {creator_name} ({member_count} total, {scanned} chats checked)')
 
-            return True, f'Added {added} users to "{list_name}" list of {creator_name}'
+            next_cursor, reached_cutoff = None, False
+            while not reached_cutoff:
+                if task_id:
+                    success, task_status = Utils.check_task_status(task_id)
+                    if success and task_status['status'].lower() in ['cancelled', 'canceled']:
+                        await flush()
+                        return False, 'Task canceled'
+                params = {'limit': 50}
+                if next_cursor:params['next'] = next_cursor
+                async with session.get('https://api.maloum.com/chats', params=params, proxy=proxies, timeout=60) as response:
+                    if response.status == 401:
+                        raise SessionExpired(await _http_failure(response, f'Fetch chats of {creator_name}'))
+                    if not response.ok:
+                        return False, f'{await _http_failure(response, f"Fetch chats of {creator_name}")} (added {added} before failing)'
+                    body = await response.json()
+
+                chats, to_resolve = body.get('data', []), []
+                for chat in chats:
+                    activity = _parse_iso((chat.get('lastRelevantMessage') or {}).get('sentAt') or chat.get('createdAt'))
+                    if cutoff and activity and activity < cutoff:
+                        reached_cutoff = True
+                        break
+                    scanned += 1
+                    if (chat.get('chatPartner') or {}).get('isCreator', False):
+                        continue
+                    if any(tag.get('listId') == list_id for tag in chat.get('taggedLists') or []):
+                        continue
+                    to_resolve.append(chat)
+
+                for partner_id in await asyncio.gather(*[resolve(chat) for chat in to_resolve]):
+                    if not partner_id:
+                        unresolved += 1
+                        continue
+                    if partner_id in seen:
+                        continue
+                    seen.add(partner_id)
+                    pending.append(partner_id)
+
+                await flush()
+
+                next_cursor = body.get('next')
+                if not next_cursor or not chats:
+                    break
+
+            await flush()
+
+            details = f'{scanned} chats checked'
+            if throttle.hits:
+                details += f', throttled {throttle.hits} times'
+            if unresolved:
+                # keep the previous sync time so the next run rescans the chats that failed
+                details += f', {unresolved} chats could not be resolved and will be retried next run'
+            else:
+                sync_state[list_id] = started_at
+                success, msg = self.update(creator, {'list_sync': sync_state})
+                if not success:Utils.write_log(msg)
+
+            if added == 0:
+                return True, f'"{list_name}" list of {creator_name} is up to date ({details})'
+            return True, f'Added {added} users to "{list_name}" list of {creator_name} ({details})'
         except SessionExpired:
             raise
+        except RuntimeError as e:
+            return False, str(e)
         except Exception as e:
             return False, f'Error syncing "{list_name}" list for {creator_name}: {e}'
+
+    async def _chat_partner_id(self, session, chat, own_user_id, proxies, throttle):
+        sender_id = (chat.get('lastRelevantMessage') or {}).get('senderId')
+        if sender_id and sender_id != own_user_id:
+            return sender_id
+
+        chat_id = chat.get('_id')
+        success, recipient_id = Utils.get_chat_recipient(chat_id)
+        if success and recipient_id:
+            return recipient_id
+
+        async with await _throttled(throttle, session, 'get', f'https://api.maloum.com/chats/{chat_id}', proxy=proxies, timeout=60) as response:
+            if response.status == 401:
+                raise SessionExpired(await _http_failure(response, f'Fetch chat {chat_id}'))
+            if not response.ok:
+                Utils.write_log(f'--- {await _http_failure(response, f"Fetch chat {chat_id}")} ---')
+                return None
+            return ((await response.json()).get('chatPartner') or {}).get('_id')
 
     async def sync_list(self, admin, task_id, creator, config):
         try:
@@ -936,16 +1109,17 @@ class Creator:
             )
             if not success:raise Exception(creator_data)
             creator_name = creator_data['details']['user']['username']
+            own_user_id = creator_data['details']['user'].get('_id')
 
             async with _http_session() as session:
                 session.headers.update(creator_data.get('headers'))
                 session.headers.update(self._trace_headers())
                 session.cookie_jar.update_cookies(creator_data.get('cookies'))
-                proxies = creator_data.get('proxies', Utils.format_proxy(random.choice(self.proxies))) if creator_data.get('reuse_ip', True) else Utils.format_proxy(random.choice(self.proxies))
+                proxies = creator_data.get('proxies') or self._proxy()
 
-                list_args = (config.get('list_name') or 'All', config.get('list_tag') or 'all')
+                list_args = (config.get('list_name') or 'All', config.get('list_tag') or 'all', task_id)
                 try:
-                    return await self.sync_all_list(session, creator, creator_name, proxies, *list_args)
+                    return await self.sync_all_list(session, creator, creator_name, own_user_id, proxies, *list_args)
                 except SessionExpired as e:
                     Utils.write_log(f'--- Session for {creator_name} expired, refreshing: {e} ---')
                     success, refreshed = await self.login(
@@ -958,7 +1132,7 @@ class Creator:
                     session.headers.update(self._trace_headers())
                     session.cookie_jar.update_cookies(refreshed.get('cookies') or {})
                     try:
-                        return await self.sync_all_list(session, creator, creator_name, proxies, *list_args)
+                        return await self.sync_all_list(session, creator, creator_name, own_user_id, proxies, *list_args)
                     except SessionExpired as e:
                         return False, f'Session for {creator_name} was rejected again after relogin: {e}'
 
@@ -1019,7 +1193,7 @@ class Creator:
                 session.headers.update(creator_data.get('headers'))
                 session.headers.update(self._trace_headers())
                 session.cookie_jar.update_cookies(creator_data.get('cookies'))
-                proxies = creator_data.get('proxies', Utils.format_proxy(random.choice(self.proxies))) if creator_data.get('reuse_ip', True) else Utils.format_proxy(random.choice(self.proxies))
+                proxies = creator_data.get('proxies') or self._proxy()
 
                 limit = max_actions
                 users, found_users = [], 0
@@ -1043,6 +1217,10 @@ class Creator:
                 success_messages = 0
                 backfilled_messages = 0
                 session_refreshed = False
+                throttle = _Throttle(
+                    f'messages for {creator_name}',
+                    report=lambda msg: (Utils.write_log(f'--- {msg} ---'), Utils.update_client({'msg': msg, 'status': 'success', 'type': 'message'}))
+                )
 
                 random.shuffle(users)
 
@@ -1071,7 +1249,8 @@ class Creator:
                             continue
 
                         # Create new chat
-                        async with session.post(
+                        async with await _throttled(
+                            throttle, session, 'post',
                             'https://api.maloum.com/chats',
                             json={'member2': recipient_id},
                             proxy=proxies,
@@ -1120,7 +1299,8 @@ class Creator:
                             continue
 
                         # Check for existing messages in the chat
-                        async with session.get(
+                        async with await _throttled(
+                            throttle, session, 'get',
                             f'https://api.maloum.com/chats/{chat_id}/messages',
                             params={'limit': 50},   # fetch enough to find the creator's last msg
                             proxy=proxies,
@@ -1210,7 +1390,8 @@ class Creator:
                         await asyncio.sleep(random.randint(2, 5))
 
                         # Send the message
-                        async with session.post(
+                        async with await _throttled(
+                            throttle, session, 'post',
                             f'https://api.maloum.com/chats/{chat_id}/messages',
                             json=json_data,
                             proxy=proxies,
@@ -1280,11 +1461,12 @@ class Creator:
             success, msg = self.update(creator, {'message_offset': offset})
             if not success:Utils.write_log(msg)
             
+            throttled = f' (throttled {throttle.hits} times)' if throttle.hits else ''
             if success_messages > 0:
-                return True, f'Successfully sent messages to {success_messages} users by {creator_name}'
+                return True, f'Successfully sent messages to {success_messages} users by {creator_name}{throttled}'
             if backfilled_messages > 0:
-                return True, f'No new messages sent by {creator_name}; recorded {backfilled_messages} existing chats'
-            return False, f'{creator_name} could not send any messages to users'
+                return True, f'No new messages sent by {creator_name}; recorded {backfilled_messages} existing chats{throttled}'
+            return False, f'{creator_name} could not send any messages to users{throttled}'
 
         except Exception as e:
             return False, f'Error sending messages to users for {creator.get("id")}: {str(e)}'
@@ -1328,12 +1510,14 @@ class Creator:
                 user_data = user.get('data', {})
                 new_user = creator_id is None
 
-                if reuse_ip and 'proxies' in user_data:
-                    proxies = user_data['proxies']
-                else:proxies = Utils.format_proxy(random.choice(self.proxies))
-                proxies = Utils.format_proxy(random.choice(self.proxies))
+                proxies = self._proxy(user_data.get('proxies'), reuse_ip)
+                Utils.write_log(f'--- Logging in {email} with proxy {_redact_proxy(proxies)} ---')
 
-                print(f'--- Logging in {email} with proxy {proxies} ---')
+                if not new_user and user_data.get('proxies') != proxies:
+                    user_data['proxies'] = proxies
+                    if not _mitmweb_enabled():
+                        success, msg = Utils.merge_creator_data(creator_id, {'proxies': proxies})
+                        if not success:Utils.write_log(msg)
 
                 stored_token = _auth_token(user_data.get('headers'))
                 if not new_user and stale_token and stored_token and stored_token != stale_token:
@@ -1346,10 +1530,9 @@ class Creator:
                     session.headers.update(user_data.get('headers', {}))
                     session.headers.update(self._trace_headers())
                     session.cookie_jar.update_cookies(user_data.get('cookies') or {})
-                    stored_proxies = user_data.get('proxies') or proxies
                     async with session.get(
                         'https://api.maloum.com/users/current',
-                        proxy=stored_proxies,
+                        proxy=proxies,
                         timeout=60
                     ) as response:
                         if response.status == 200:
@@ -1780,6 +1963,8 @@ class _MALOUM:
                     else:
                         success, result = False, str(item)
 
+                    if result == 'Task canceled':
+                        continue
                     label = 'Lists' if success else 'Error syncing lists'
                     Utils.update_client({'msg': f'{label} on {task_id}: {result}', 'status': 'success' if success else 'error', 'type': 'message'})
                     Utils.write_log(f'=== {result} ===')
