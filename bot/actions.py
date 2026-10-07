@@ -41,6 +41,10 @@ class SessionExpired(Exception):
     """Maloum rejected the account's access token (HTTP 401)."""
 
 
+class AccountBlockedError(Exception):
+    """Cloudflare rejected the account that sent the request (HTTP 403)."""
+
+
 _session_locks = {}
 _session_locks_guard = threading.Lock()
 
@@ -153,6 +157,13 @@ async def _http_failure(response, action):
 
 def is_account_blocked(result):
     return 'blocked by Cloudflare (HTTP 403)' in str(result or '')
+
+
+def reject_if_blocked(response, email, account_id, delete_blocked, action):
+    if getattr(response, 'status', None) != 403:
+        return
+    record_blocked_account(email, account_id, delete_blocked)
+    raise AccountBlockedError(f'{email} blocked by Cloudflare (HTTP 403) during {action}')
 
 
 def record_blocked_account(email, creator_id, delete_blocked):
@@ -738,10 +749,13 @@ class Creator:
             except Exception as e:
                 return False, f'Error saving media ID {post_id} for creator {creator_id}: {str(e)}'
 
-    async def scrape_users(self, scraper, admin, task_id, count=50, limit=50, offset=0, last_activity=7):
+    async def scrape_users(self, scraper, admin, task_id, count=50, limit=50, offset=0, last_activity=7, delete_blocked=False):
         try:
             if not isinstance(scraper, dict) or not scraper.get('id'):
                 return False, f'Scraper is not logged in: {scraper}'
+
+            account_id = scraper.get('id')
+            account_email = ((scraper.get('details') or {}).get('user') or {}).get('email') or account_id
 
             success, task_status = Utils.check_task_status(task_id)
             if not success:
@@ -789,6 +803,7 @@ class Creator:
                     proxy=proxies,
                     timeout=120
                 ) as response:
+                    reject_if_blocked(response, account_email, account_id, delete_blocked, 'Set preferences')
                     if response.status == 401:
                         raise SessionExpired(await _http_failure(response, 'Set preferences'))
                     if not response.ok:
@@ -804,6 +819,7 @@ class Creator:
                     proxy=proxies,
                     timeout=90
                 ) as response:
+                    reject_if_blocked(response, account_email, account_id, delete_blocked, 'Get discovery posts')
                     if response.status == 401:
                         raise SessionExpired(await _http_failure(response, 'Get discovery posts'))
                     if not response.ok:
@@ -895,6 +911,7 @@ class Creator:
                                     proxy=proxies,
                                     timeout=120
                                 ) as response:
+                                    reject_if_blocked(response, account_email, account_id, delete_blocked, f'Get comments for post {post_id}')
                                     if not response.ok:
                                         raise Exception(await _http_failure(response, f'Get comments for post {post_id}'))
 
@@ -935,6 +952,8 @@ class Creator:
 
                         return True, f'{post.get("commentCount")} processed for post {post_id}'
 
+                    except AccountBlockedError:
+                        raise
                     except Exception as error:
                         if error == '':
                             tb = traceback.format_exc()
@@ -944,6 +963,8 @@ class Creator:
                 tasks = [process_post(post) for post in posts]
                 results = await asyncio.gather(*tasks, return_exceptions=True)
                 for i, result in enumerate(results):
+                    if isinstance(result, AccountBlockedError):
+                        raise result
                     if isinstance(result, Exception):
                         Utils.write_log(result)
                     elif isinstance(result, tuple) and not result[0]:
@@ -955,18 +976,19 @@ class Creator:
                     return False, f'No valid users found for {scraper["id"]}'
                 return True, f'Scraped {len(valid_users)} users by {scraper["id"]}'
 
-        except SessionExpired:
+        except (SessionExpired, AccountBlockedError):
             raise
         except Exception as e:
             return False, f'Error scraping users: {e}'
 
 
-    async def _find_chat_list(self, session, name, proxies):
+    async def _find_chat_list(self, session, name, proxies, account_email=None, account_id=None, delete_blocked=False):
         next_offset = None
         while True:
             params = {'limit': 25}
             if next_offset is not None:params['next'] = next_offset
             async with session.get('https://api.maloum.com/chat-lists', params=params, proxy=proxies, timeout=60) as response:
+                reject_if_blocked(response, account_email, account_id, delete_blocked, 'Fetch chat lists')
                 if response.status == 401:
                     raise SessionExpired(await _http_failure(response, 'Fetch chat lists'))
                 if not response.ok:
@@ -979,14 +1001,18 @@ class Creator:
             if next_offset is None or not body.get('data'):
                 return True, None
 
-    async def sync_all_list(self, session, creator, creator_name, own_user_id, proxies, list_name='All', list_tag='all', task_id=None):
+    async def sync_all_list(self, session, creator, creator_name, own_user_id, proxies, list_name='All', list_tag='all', task_id=None, delete_blocked=False):
         def report(msg):
             Utils.write_log(f'--- {msg} ---')
             Utils.update_client({'msg': msg, 'status': 'success', 'type': 'message'})
 
         try:
+            account_id = creator.get('id')
+            account_email = creator.get('email') or creator_name
             report(f'Looking for "{list_name}" list of {creator_name}')
-            success, chat_list = await self._find_chat_list(session, list_name, proxies)
+            success, chat_list = await self._find_chat_list(
+                session, list_name, proxies, account_email, account_id, delete_blocked
+            )
             if not success:return False, chat_list
 
             if chat_list is None:
@@ -996,6 +1022,7 @@ class Creator:
                     proxy=proxies,
                     timeout=60
                 ) as response:
+                    reject_if_blocked(response, account_email, account_id, delete_blocked, f'Create "{list_name}" list for {creator_name}')
                     if response.status == 401:
                         raise SessionExpired(await _http_failure(response, f'Create "{list_name}" list for {creator_name}'))
                     if not response.ok:
@@ -1027,6 +1054,7 @@ class Creator:
             async def refresh_member_count():
                 nonlocal member_count
                 async with session.get(f'https://api.maloum.com/chat-lists/{list_id}', proxy=proxies, timeout=60) as response:
+                    reject_if_blocked(response, account_email, account_id, delete_blocked, f'Fetch "{list_name}" list of {creator_name}')
                     if response.status == 401:
                         raise SessionExpired(await _http_failure(response, f'Fetch "{list_name}" list of {creator_name}'))
                     if response.ok:
@@ -1034,7 +1062,10 @@ class Creator:
 
             async def resolve(chat):
                 async with lookup_slots:
-                    return await self._chat_partner_id(session, chat, own_user_id, proxies, throttle)
+                    return await self._chat_partner_id(
+                        session, chat, own_user_id, proxies, throttle,
+                        account_email, account_id, delete_blocked
+                    )
 
             async def flush():
                 nonlocal pending, added
@@ -1045,6 +1076,7 @@ class Creator:
                     proxy=proxies,
                     timeout=60
                 ) as response:
+                    reject_if_blocked(response, account_email, account_id, delete_blocked, f'Add users to "{list_name}" list of {creator_name}')
                     if response.status == 401:
                         raise SessionExpired(await _http_failure(response, f'Add users to "{list_name}" list of {creator_name}'))
                     if not response.ok:
@@ -1065,6 +1097,7 @@ class Creator:
                 params = {'limit': 50}
                 if next_cursor:params['next'] = next_cursor
                 async with session.get('https://api.maloum.com/chats', params=params, proxy=proxies, timeout=60) as response:
+                    reject_if_blocked(response, account_email, account_id, delete_blocked, f'Fetch chats of {creator_name}')
                     if response.status == 401:
                         raise SessionExpired(await _http_failure(response, f'Fetch chats of {creator_name}'))
                     if not response.ok:
@@ -1115,14 +1148,14 @@ class Creator:
             if added == 0:
                 return True, f'"{list_name}" list of {creator_name} is up to date ({details})'
             return True, f'Added {added} users to "{list_name}" list of {creator_name} ({details})'
-        except SessionExpired:
+        except (SessionExpired, AccountBlockedError):
             raise
         except RuntimeError as e:
             return False, str(e)
         except Exception as e:
             return False, f'Error syncing "{list_name}" list for {creator_name}: {e}'
 
-    async def _chat_partner_id(self, session, chat, own_user_id, proxies, throttle):
+    async def _chat_partner_id(self, session, chat, own_user_id, proxies, throttle, account_email=None, account_id=None, delete_blocked=False):
         sender_id = (chat.get('lastRelevantMessage') or {}).get('senderId')
         if sender_id and sender_id != own_user_id:
             return sender_id
@@ -1133,6 +1166,7 @@ class Creator:
             return recipient_id
 
         async with await _throttled(throttle, session, 'get', f'https://api.maloum.com/chats/{chat_id}', proxy=proxies, timeout=60) as response:
+            reject_if_blocked(response, account_email, account_id, delete_blocked, f'Fetch chat {chat_id}')
             if response.status == 401:
                 raise SessionExpired(await _http_failure(response, f'Fetch chat {chat_id}'))
             if not response.ok:
@@ -1169,7 +1203,10 @@ class Creator:
 
                 list_args = (config.get('list_name') or 'All', config.get('list_tag') or 'all', task_id)
                 try:
-                    return await self.sync_all_list(session, creator, creator_name, own_user_id, proxies, *list_args)
+                    return await self.sync_all_list(
+                        session, creator, creator_name, own_user_id, proxies, *list_args,
+                        delete_blocked=bool(config.get('delete_blocked'))
+                    )
                 except SessionExpired as e:
                     Utils.write_log(f'--- Session for {creator_name} expired, refreshing: {e} ---')
                     success, refreshed = await self.login(
@@ -1183,7 +1220,10 @@ class Creator:
                     session.headers.update(self._trace_headers())
                     session.cookie_jar.update_cookies(refreshed.get('cookies') or {})
                     try:
-                        return await self.sync_all_list(session, creator, creator_name, own_user_id, proxies, *list_args)
+                        return await self.sync_all_list(
+                            session, creator, creator_name, own_user_id, proxies, *list_args,
+                            delete_blocked=bool(config.get('delete_blocked'))
+                        )
                     except SessionExpired as e:
                         return False, f'Session for {creator_name} was rejected again after relogin: {e}'
 
@@ -1308,6 +1348,7 @@ class Creator:
                             proxy=proxies,
                             timeout=90
                         ) as response:
+                            reject_if_blocked(response, email, creator_internal_id, bool(config.get('delete_blocked')), f'Create chat for {username}')
                             if response.status == 401:
                                 raise SessionExpired(await _http_failure(response, f'Create chat for {username}'))
                             if not response.ok:
@@ -1358,6 +1399,7 @@ class Creator:
                             proxy=proxies,
                             timeout=90
                         ) as response:
+                            reject_if_blocked(response, email, creator_internal_id, bool(config.get('delete_blocked')), f'Check messages for chat {chat_id}')
                             if response.status == 401:
                                 raise SessionExpired(await _http_failure(response, f'Check messages for chat {chat_id}'))
                             if not response.ok:
@@ -1449,6 +1491,7 @@ class Creator:
                             proxy=proxies,
                             timeout=90
                         ) as response:
+                            reject_if_blocked(response, email, creator_internal_id, bool(config.get('delete_blocked')), f'Send message for chat {chat_id}')
                             if response.status == 401:
                                 raise SessionExpired(await _http_failure(response, f'Send message for chat {chat_id}'))
                             if not response.ok:
@@ -1487,6 +1530,8 @@ class Creator:
                         if success_messages >= max_actions:
                             break
 
+                    except AccountBlockedError:
+                        raise
                     except SessionExpired as e:
                         if session_refreshed:
                             return False, f'Session for {creator_name} was rejected again after relogin: {e}'
@@ -2090,7 +2135,10 @@ class _MALOUM:
 
     async def _scrape_with_refresh(self, admin, task_id, config, target_scraper, scraper, count, last_activity, offset):
         try:
-            return await Creator().scrape_users(scraper, admin, task_id, count=count, last_activity=last_activity, offset=offset)
+            return await Creator().scrape_users(
+                scraper, admin, task_id, count=count, last_activity=last_activity, offset=offset,
+                delete_blocked=bool(config.get('delete_blocked'))
+            )
         except SessionExpired as error:
             email = target_scraper['email']
             Utils.write_log(f'--- Session for {email} expired, refreshing: {error} ---')
@@ -2107,7 +2155,10 @@ class _MALOUM:
             if not success:
                 return False, f'Could not refresh session for {email}: {scraper}'
             try:
-                return await Creator().scrape_users(scraper, admin, task_id, count=count, last_activity=last_activity, offset=offset)
+                return await Creator().scrape_users(
+                    scraper, admin, task_id, count=count, last_activity=last_activity, offset=offset,
+                    delete_blocked=bool(config.get('delete_blocked'))
+                )
             except SessionExpired as error:
                 return False, f'Session for {email} was rejected again after relogin: {error}'
 
@@ -2183,9 +2234,20 @@ class _MALOUM:
                     await asyncio.sleep(5)
                     continue
 
-                success, result = await self._scrape_with_refresh(
-                    admin, task_id, config, target_scraper, scraper, count, last_activity, offset
-                )
+                try:
+                    success, result = await self._scrape_with_refresh(
+                        admin, task_id, config, target_scraper, scraper, count, last_activity, offset
+                    )
+                except AccountBlockedError as error:
+                    success, result = False, str(error)
+
+                if not success and is_account_blocked(result):
+                    client_msg = {'msg': f'Error scraping users on {task_id}: {result}', 'status': 'error', 'type': 'message'}
+                    Utils.update_client(client_msg)
+                    Utils.write_log(f'=== {result} ===')
+                    i = i + 1 if i < len(scrapers) - 1 else 0
+                    await asyncio.sleep(5)
+                    continue
 
                 if not success:
                     client_msg = {'msg': f'Error scraping users on {task_id}: {result}', 'status': 'error', 'type': 'message'}
