@@ -1,4 +1,4 @@
-from app_configs import creators_file,configs_folder,universal_files
+from app_configs import creators_file,configs_folder,universal_files,app_name
 from utils import Utils
 from configs import *
 import io, threading, socketio, asyncio, traceback, base64
@@ -159,27 +159,31 @@ def is_account_blocked(result):
     return 'blocked by Cloudflare (HTTP 403)' in str(result or '')
 
 
+def removed_from_pool(account):
+    return f'{account} blocked by {app_name}, removed from pool'
+
+
+def was_removed_from_pool(result):
+    return 'removed from pool' in str(result or '')
+
+
 def reject_if_blocked(response, email, account_id, delete_blocked, action):
     if getattr(response, 'status', None) != 403:
         return
-    record_blocked_account(email, account_id, delete_blocked)
-    raise AccountBlockedError(f'{email} blocked by Cloudflare (HTTP 403) during {action}')
+    _, message = record_blocked_account(email, account_id, delete_blocked)
+    raise AccountBlockedError(message)
 
 
 def record_blocked_account(email, creator_id, delete_blocked):
-    message = f'{email} blocked by Cloudflare (HTTP 403)'
     if delete_blocked and creator_id:
         success, msg = Utils.set_creator_status(creator_id, 'deleted')
         if success:
-            Utils.write_log(f'Marked {email} as deleted after a Cloudflare block')
-            Utils.update_client({
-                'msg': f'Marked {email} as deleted (blocked by Cloudflare)',
-                'status': 'error',
-                'type': 'message',
-            })
-        else:
-            Utils.write_log(f'Failed to mark {email} as deleted: {msg}')
-    return False, message
+            message = removed_from_pool(email)
+            Utils.write_log(message)
+            Utils.update_client({'msg': message, 'status': 'error', 'type': 'message'})
+            return True, message
+        Utils.write_log(f'Failed to mark {email} as deleted: {msg}')
+    return False, f'{email} blocked by Cloudflare (HTTP 403)'
 
 
 def _drop_deleted_accounts(accounts):
@@ -1610,7 +1614,8 @@ class Creator:
                 new_user = creator_id is None
 
                 def blocked():
-                    return record_blocked_account(email, creator_id, delete_blocked)
+                    removed, message = record_blocked_account(email, creator_id, delete_blocked)
+                    return False, message
 
                 def accepted(data):
                     if creator_id:
@@ -1976,6 +1981,8 @@ class _MALOUM:
                     else:
                         success, result = False, str(item)
 
+                    if was_removed_from_pool(result):
+                        continue
                     if not success:
                         client_msg = {'msg': f'Error messaging users on {task_id}: {result}', 'status': 'error', 'type': 'message'}
                         success, msg = Utils.update_client(client_msg)
@@ -2093,7 +2100,7 @@ class _MALOUM:
                     else:
                         success, result = False, str(item)
 
-                    if result == 'Task canceled':
+                    if result == 'Task canceled' or was_removed_from_pool(result):
                         continue
                     label = 'Lists' if success else 'Error syncing lists'
                     Utils.update_client({'msg': f'{label} on {task_id}: {result}', 'status': 'success' if success else 'error', 'type': 'message'})
@@ -2227,9 +2234,10 @@ class _MALOUM:
 
                 if not success:
                     result = scraper if isinstance(scraper, str) else f'Login failed for {email}'
-                    client_msg = {'msg': f'Error scraping users on {task_id}: {result}', 'status': 'error', 'type': 'message'}
-                    Utils.update_client(client_msg)
-                    Utils.write_log(f'=== {result} ===')
+                    if not was_removed_from_pool(result):
+                        client_msg = {'msg': f'Error scraping users on {task_id}: {result}', 'status': 'error', 'type': 'message'}
+                        Utils.update_client(client_msg)
+                        Utils.write_log(f'=== {result} ===')
                     i = i + 1 if i < len(scrapers) - 1 else 0
                     await asyncio.sleep(5)
                     continue
@@ -2241,10 +2249,11 @@ class _MALOUM:
                 except AccountBlockedError as error:
                     success, result = False, str(error)
 
-                if not success and is_account_blocked(result):
-                    client_msg = {'msg': f'Error scraping users on {task_id}: {result}', 'status': 'error', 'type': 'message'}
-                    Utils.update_client(client_msg)
-                    Utils.write_log(f'=== {result} ===')
+                if not success and (was_removed_from_pool(result) or is_account_blocked(result)):
+                    if not was_removed_from_pool(result):
+                        client_msg = {'msg': f'Error scraping users on {task_id}: {result}', 'status': 'error', 'type': 'message'}
+                        Utils.update_client(client_msg)
+                        Utils.write_log(f'=== {result} ===')
                     i = i + 1 if i < len(scrapers) - 1 else 0
                     await asyncio.sleep(5)
                     continue
