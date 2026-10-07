@@ -131,15 +131,16 @@ def _format_network_error(error, method=None, url=None, proxy=None, timeout=None
 _DROP_RETRIES = 2
 # the request never reached the server, so any method is safe to resend
 _NOT_SENT_CODES = ('curl: (5)', 'curl: (7)', 'curl: (35)', 'curl: (60)', 'curl: (97)')
-# the connection died mid-request; only resend requests that can't duplicate side effects
+# the connection died mid-request; resend reads plus POST and PATCH
 _DROPPED_CODES = ('curl: (16)', 'curl: (52)', 'curl: (55)', 'curl: (56)', 'curl: (92)')
+_DROPPED_METHODS = ('GET', 'HEAD', 'POST', 'PATCH')
 
 
 def _is_dropped_connection(error, method):
     raw = str(error)
     if any(code in raw for code in _NOT_SENT_CODES):
         return True
-    return method.upper() in ('GET', 'HEAD') and any(code in raw for code in _DROPPED_CODES)
+    return method.upper() in _DROPPED_METHODS and any(code in raw for code in _DROPPED_CODES)
 
 
 async def _http_failure(response, action):
