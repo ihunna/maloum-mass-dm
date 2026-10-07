@@ -147,16 +147,46 @@ def _is_dropped_connection(error, method):
     return method.upper() in _DROPPED_METHODS and any(code in raw for code in _DROPPED_CODES)
 
 
+def _is_cloudflare_body(body, headers):
+    snippet = (body or '').strip()
+    mitigated = ''
+    if headers is not None and hasattr(headers, 'get'):
+        mitigated = str(headers.get('cf-mitigated') or '')
+    lower = snippet.lower()
+    return (
+        not snippet
+        or snippet.lstrip().startswith('<')
+        or 'just a moment' in lower
+        or 'you have been blocked' in lower
+        or bool(mitigated)
+    )
+
+
+async def _is_maloum_auth_block(response):
+    """Maloum's API refused this account. A Cloudflare 403 is not an auth block."""
+    if getattr(response, 'status', None) != 403:
+        return False
+    body = await response.text() or ''
+    if _is_cloudflare_body(body, getattr(response, 'headers', None)):
+        return False
+    try:
+        data = json.loads(body)
+    except Exception:
+        return False
+    return isinstance(data, dict)
+
+
 async def _http_failure(response, action):
     body = (await response.text() or '').strip()
     snippet = ' '.join(body.split())[:240] or 'empty body'
-    if snippet.lstrip().startswith('<') or 'Just a moment' in snippet or 'cf-mitigated' in response.headers:
+    if _is_cloudflare_body(body, getattr(response, 'headers', None)):
         return f'{action} blocked by Cloudflare (HTTP {response.status})'
     return f'{action} failed (HTTP {response.status}): {snippet}'
 
 
 def is_account_blocked(result):
-    return 'blocked by Cloudflare (HTTP 403)' in str(result or '')
+    text = str(result or '')
+    return was_removed_from_pool(text) or f'blocked by {app_name}' in text
 
 
 def removed_from_pool(account):
@@ -165,13 +195,6 @@ def removed_from_pool(account):
 
 def was_removed_from_pool(result):
     return 'removed from pool' in str(result or '')
-
-
-def reject_if_blocked(response, email, account_id, delete_blocked, action):
-    if getattr(response, 'status', None) != 403:
-        return
-    _, message = record_blocked_account(email, account_id, delete_blocked)
-    raise AccountBlockedError(message)
 
 
 def record_blocked_account(email, creator_id, delete_blocked):
@@ -183,7 +206,7 @@ def record_blocked_account(email, creator_id, delete_blocked):
             Utils.update_client({'msg': message, 'status': 'error', 'type': 'message'})
             return True, message
         Utils.write_log(f'Failed to mark {email} as deleted: {msg}')
-    return False, f'{email} blocked by Cloudflare (HTTP 403)'
+    return False, f'{email} is blocked by {app_name}'
 
 
 def _drop_deleted_accounts(accounts):
@@ -197,7 +220,7 @@ def _drop_deleted_accounts(accounts):
 
 
 def _is_retryable_error(result):
-    if is_account_blocked(result):
+    if was_removed_from_pool(result) or f'is blocked by {app_name}' in str(result or ''):
         return False
     if isinstance(result, NetworkError):
         return True
@@ -415,7 +438,16 @@ class _HttpSession:
                     timeout=timeout,
                     **kwargs,
                 )
-                return _HttpResponse(response)
+                wrapped = _HttpResponse(response)
+                if (
+                    wrapped.status == 403
+                    and attempt <= _DROP_RETRIES
+                    and not await _is_maloum_auth_block(wrapped)
+                ):
+                    await asyncio.sleep(attempt)
+                    await self._ensure_client(proxy, reconnect=True)
+                    continue
+                return wrapped
             except (RequestException, OSError) as error:
                 if attempt > _DROP_RETRIES or not _is_dropped_connection(error, method):
                     raise NetworkError(_format_network_error(
@@ -807,7 +839,6 @@ class Creator:
                     proxy=proxies,
                     timeout=120
                 ) as response:
-                    reject_if_blocked(response, account_email, account_id, delete_blocked, 'Set preferences')
                     if response.status == 401:
                         raise SessionExpired(await _http_failure(response, 'Set preferences'))
                     if not response.ok:
@@ -823,7 +854,6 @@ class Creator:
                     proxy=proxies,
                     timeout=90
                 ) as response:
-                    reject_if_blocked(response, account_email, account_id, delete_blocked, 'Get discovery posts')
                     if response.status == 401:
                         raise SessionExpired(await _http_failure(response, 'Get discovery posts'))
                     if not response.ok:
@@ -915,7 +945,6 @@ class Creator:
                                     proxy=proxies,
                                     timeout=120
                                 ) as response:
-                                    reject_if_blocked(response, account_email, account_id, delete_blocked, f'Get comments for post {post_id}')
                                     if not response.ok:
                                         raise Exception(await _http_failure(response, f'Get comments for post {post_id}'))
 
@@ -992,7 +1021,6 @@ class Creator:
             params = {'limit': 25}
             if next_offset is not None:params['next'] = next_offset
             async with session.get('https://api.maloum.com/chat-lists', params=params, proxy=proxies, timeout=60) as response:
-                reject_if_blocked(response, account_email, account_id, delete_blocked, 'Fetch chat lists')
                 if response.status == 401:
                     raise SessionExpired(await _http_failure(response, 'Fetch chat lists'))
                 if not response.ok:
@@ -1026,7 +1054,6 @@ class Creator:
                     proxy=proxies,
                     timeout=60
                 ) as response:
-                    reject_if_blocked(response, account_email, account_id, delete_blocked, f'Create "{list_name}" list for {creator_name}')
                     if response.status == 401:
                         raise SessionExpired(await _http_failure(response, f'Create "{list_name}" list for {creator_name}'))
                     if not response.ok:
@@ -1058,7 +1085,6 @@ class Creator:
             async def refresh_member_count():
                 nonlocal member_count
                 async with session.get(f'https://api.maloum.com/chat-lists/{list_id}', proxy=proxies, timeout=60) as response:
-                    reject_if_blocked(response, account_email, account_id, delete_blocked, f'Fetch "{list_name}" list of {creator_name}')
                     if response.status == 401:
                         raise SessionExpired(await _http_failure(response, f'Fetch "{list_name}" list of {creator_name}'))
                     if response.ok:
@@ -1080,7 +1106,6 @@ class Creator:
                     proxy=proxies,
                     timeout=60
                 ) as response:
-                    reject_if_blocked(response, account_email, account_id, delete_blocked, f'Add users to "{list_name}" list of {creator_name}')
                     if response.status == 401:
                         raise SessionExpired(await _http_failure(response, f'Add users to "{list_name}" list of {creator_name}'))
                     if not response.ok:
@@ -1101,7 +1126,6 @@ class Creator:
                 params = {'limit': 50}
                 if next_cursor:params['next'] = next_cursor
                 async with session.get('https://api.maloum.com/chats', params=params, proxy=proxies, timeout=60) as response:
-                    reject_if_blocked(response, account_email, account_id, delete_blocked, f'Fetch chats of {creator_name}')
                     if response.status == 401:
                         raise SessionExpired(await _http_failure(response, f'Fetch chats of {creator_name}'))
                     if not response.ok:
@@ -1170,7 +1194,6 @@ class Creator:
             return recipient_id
 
         async with await _throttled(throttle, session, 'get', f'https://api.maloum.com/chats/{chat_id}', proxy=proxies, timeout=60) as response:
-            reject_if_blocked(response, account_email, account_id, delete_blocked, f'Fetch chat {chat_id}')
             if response.status == 401:
                 raise SessionExpired(await _http_failure(response, f'Fetch chat {chat_id}'))
             if not response.ok:
@@ -1352,7 +1375,6 @@ class Creator:
                             proxy=proxies,
                             timeout=90
                         ) as response:
-                            reject_if_blocked(response, email, creator_internal_id, bool(config.get('delete_blocked')), f'Create chat for {username}')
                             if response.status == 401:
                                 raise SessionExpired(await _http_failure(response, f'Create chat for {username}'))
                             if not response.ok:
@@ -1403,7 +1425,6 @@ class Creator:
                             proxy=proxies,
                             timeout=90
                         ) as response:
-                            reject_if_blocked(response, email, creator_internal_id, bool(config.get('delete_blocked')), f'Check messages for chat {chat_id}')
                             if response.status == 401:
                                 raise SessionExpired(await _http_failure(response, f'Check messages for chat {chat_id}'))
                             if not response.ok:
@@ -1495,7 +1516,6 @@ class Creator:
                             proxy=proxies,
                             timeout=90
                         ) as response:
-                            reject_if_blocked(response, email, creator_internal_id, bool(config.get('delete_blocked')), f'Send message for chat {chat_id}')
                             if response.status == 401:
                                 raise SessionExpired(await _http_failure(response, f'Send message for chat {chat_id}'))
                             if not response.ok:
@@ -1650,7 +1670,7 @@ class Creator:
                         proxy=proxies,
                         timeout=60
                     ) as response:
-                        if response.status == 403:
+                        if response.status == 403 and await _is_maloum_auth_block(response):
                             return blocked()
                         if response.status == 200:
                             return accepted(user_data)
@@ -1672,8 +1692,6 @@ class Creator:
                         proxy=proxies,
                         timeout=120
                     ) as response:
-                        if response.status == 403:
-                            return blocked()
                         if not response.ok:
                             Utils.write_log(
                                 f'could not refresh access token for {email}: '
@@ -1719,7 +1737,7 @@ class Creator:
                     proxy=proxies,
                     timeout=120
                 ) as response:
-                    if response.status == 403:
+                    if response.status == 403 and await _is_maloum_auth_block(response):
                         return blocked()
                     if response.status == 401:
                         return False, 'Credentials not correct'
@@ -1741,8 +1759,6 @@ class Creator:
                         proxy=proxies,
                         timeout=120
                     ) as response:
-                        if response.status == 403:
-                            return blocked()
                         if not response.ok:
                             raise Exception(await _http_failure(response, 'Fetch account credentials'))
                         login_state = await response.json()
@@ -1752,7 +1768,7 @@ class Creator:
                         proxy=proxies,
                         timeout=120
                     ) as response:
-                        if response.status == 403:
+                        if response.status == 403 and await _is_maloum_auth_block(response):
                             return blocked()
                         if not response.ok:
                             raise Exception(await _http_failure(response, 'Fetch current user'))
@@ -1765,7 +1781,7 @@ class Creator:
                             proxy=proxies,
                             timeout=120
                         ) as response:
-                            if response.status == 403:
+                            if response.status == 403 and await _is_maloum_auth_block(response):
                                 return blocked()
                             if not response.ok:
                                 raise Exception(await _http_failure(response, 'Fetch user profile'))
