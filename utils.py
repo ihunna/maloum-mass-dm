@@ -148,7 +148,8 @@ class Utils:
                       admin TEXT,
                       category TEXT DEFAULT 'creator',
                       task_id TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP )''')
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    status TEXT DEFAULT 'active' )''')
             
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS tasks (
@@ -192,6 +193,11 @@ class Utils:
                     category TEXT DEFAULT 'scraped'
                 )''')
             
+            cursor.execute("PRAGMA table_info(creators)")
+            creator_columns = [column[1] for column in cursor.fetchall()]
+            if 'status' not in creator_columns:
+                cursor.execute("ALTER TABLE creators ADD COLUMN status TEXT DEFAULT 'active'")
+
             conn.commit()
             
             success,msg = True, 'Tables created'
@@ -358,6 +364,42 @@ class Utils:
             return success,msg
 
     @staticmethod
+    def set_creator_status(creator_id, status):
+        success, msg = False, ''
+        conn = sqlite3.connect(db_file)
+        cursor = conn.cursor()
+        try:
+            cursor.execute("UPDATE creators SET status = ? WHERE id = ?", (status, creator_id))
+            conn.commit()
+            success, msg = True, f'Creator marked {status}'
+        except Exception as error:
+            success, msg = False, f'Error updating creator status: {error}'
+        finally:
+            conn.close()
+            return success, msg
+
+    @staticmethod
+    def deleted_creator_ids(creator_ids):
+        success, deleted = True, set()
+        conn = sqlite3.connect(db_file)
+        cursor = conn.cursor()
+        try:
+            ids = [creator_id for creator_id in creator_ids if creator_id]
+            if not ids:
+                return True, set()
+            placeholders = ','.join('?' for _ in ids)
+            cursor.execute(
+                f"SELECT id FROM creators WHERE id IN ({placeholders}) AND status = 'deleted'",
+                ids
+            )
+            deleted = {row[0] for row in cursor.fetchall()}
+        except Exception as error:
+            success, deleted = False, str(error)
+        finally:
+            conn.close()
+            return success, deleted
+
+    @staticmethod
     def update_creator(creator_id,creator_email,creator_data):
         success,msg = False,''
         conn = sqlite3.connect(db_file)
@@ -443,7 +485,7 @@ class Utils:
             return success, msg, reset
         
     @staticmethod
-    def get_creators(admin='', limit=20, offset=0, multiple=True, creator=None, category='creator', constraint=None, keyword=None, selected_creators=[], exclude_from_posts=None):
+    def get_creators(admin='', limit=20, offset=0, multiple=True, creator=None, category='creator', constraint=None, keyword=None, selected_creators=[], exclude_from_posts=None, account_status='active'):
         """
         Fetch creators with various filters and options.
         
@@ -455,82 +497,78 @@ class Utils:
         cursor = conn.cursor()
         try:
             category = {'users':'user','creators':'creator','creator':'creator'}[category]
+            if account_status == 'deleted':
+                status_sql = "COALESCE(status, 'active') = 'deleted'"
+            else:
+                status_sql = "COALESCE(status, 'active') != 'deleted'"
+
+            def creator_row(row):
+                return {
+                    'id': row[0],
+                    'email': row[1],
+                    'data': json.loads(row[2]),
+                    'created_at': row[6],
+                    'status': row[7] if len(row) > 7 and row[7] else 'active',
+                }
             
             if selected_creators:  # Check if selected_creators is not empty
                 placeholders = ','.join('?' for _ in selected_creators)  # Create placeholders for the IN clause
                 cursor.execute(
-                    f"SELECT COUNT(*) FROM creators WHERE id IN ({placeholders}) AND admin = ?",
+                    f"SELECT COUNT(*) FROM creators WHERE id IN ({placeholders}) AND admin = ? AND {status_sql}",
                     (*selected_creators, admin)
                 )
                 total_creators = cursor.fetchone()[0]
 
                 cursor.execute(
                     f"""SELECT * FROM creators 
-                    WHERE id IN ({placeholders}) AND admin = ? 
+                    WHERE id IN ({placeholders}) AND admin = ? AND {status_sql}
                     ORDER BY created_at DESC 
                     LIMIT ? OFFSET ?""",
                     (*selected_creators, admin, limit, offset)
                 )
                 rows = cursor.fetchall()
 
-                creators = [{
-                    'id': row[0], 
-                    'email': row[1],
-                    'data': json.loads(row[2]),
-                    'created_at': row[6]
-                } for row in rows]
+                creators = [creator_row(row) for row in rows]
             elif constraint is not None and keyword is not None:
                 # If constraint and keyword are provided, filter by them
-                cursor.execute(f"SELECT COUNT(*) FROM creators WHERE {constraint} = ? AND admin = ?", (keyword, admin))
+                cursor.execute(
+                    f"SELECT COUNT(*) FROM creators WHERE {constraint} = ? AND admin = ? AND {status_sql}",
+                    (keyword, admin)
+                )
                 total_creators = cursor.fetchone()[0]
 
                 cursor.execute(
                     f"""SELECT * FROM creators 
-                    WHERE {constraint} = ? AND admin = ?
+                    WHERE {constraint} = ? AND admin = ? AND {status_sql}
                     ORDER BY created_at DESC 
                     LIMIT ? OFFSET ?""",
                     (keyword, admin, limit, offset)
                 )
                 rows = cursor.fetchall()
 
-                creators = [{
-                    'id': row[0], 
-                    'email': row[1],
-                    'data': json.loads(row[2]),
-                    'created_at': row[6]
-                } for row in rows]
+                creators = [creator_row(row) for row in rows]
             else:
                 # Fallback to the original logic if no selected_creators
 
                 if multiple:
                     cursor.execute(
-                        "SELECT COUNT(*) FROM creators WHERE admin = ? AND category = ?",
+                        f"SELECT COUNT(*) FROM creators WHERE admin = ? AND category = ? AND {status_sql}",
                         (admin, category)
                     )
                     total_creators = cursor.fetchone()[0]
 
                     cursor.execute(
-                        "SELECT * FROM creators WHERE admin = ? AND category = ? ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                        f"SELECT * FROM creators WHERE admin = ? AND category = ? AND {status_sql} ORDER BY created_at DESC LIMIT ? OFFSET ?",
                         (admin, category, limit, offset)
                     )
                     rows = cursor.fetchall()
 
-                    creators = [{
-                        'id': row[0], 
-                        'email': row[1],
-                        'data': json.loads(row[2]),
-                        'created_at': row[6]
-                    } for row in rows]
+                    creators = [creator_row(row) for row in rows]
                 else:
                     cursor.execute("SELECT * FROM creators WHERE id = ?", (creator,))
                     row = cursor.fetchone()
 
-                    creators = {
-                        'id': row[0], 
-                        'email': row[1],
-                        'data': json.loads(row[2]),
-                        'created_at': row[6]
-                    } if row is not None else {}
+                    creators = creator_row(row) if row is not None else {}
 
             success = True
         except Exception as error:

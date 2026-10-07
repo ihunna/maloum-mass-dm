@@ -150,7 +150,39 @@ async def _http_failure(response, action):
     return f'{action} failed (HTTP {response.status}): {snippet}'
 
 
+def is_account_blocked(result):
+    return 'blocked by Cloudflare (HTTP 403)' in str(result or '')
+
+
+def record_blocked_account(email, creator_id, delete_blocked):
+    message = f'{email} blocked by Cloudflare (HTTP 403)'
+    if delete_blocked and creator_id:
+        success, msg = Utils.set_creator_status(creator_id, 'deleted')
+        if success:
+            Utils.write_log(f'Marked {email} as deleted after a Cloudflare block')
+            Utils.update_client({
+                'msg': f'Marked {email} as deleted (blocked by Cloudflare)',
+                'status': 'error',
+                'type': 'message',
+            })
+        else:
+            Utils.write_log(f'Failed to mark {email} as deleted: {msg}')
+    return False, message
+
+
+def _drop_deleted_accounts(accounts):
+    success, deleted = Utils.deleted_creator_ids([account.get('id') for account in accounts])
+    if not success:
+        Utils.write_log(deleted)
+        return accounts
+    if not deleted:
+        return accounts
+    return [account for account in accounts if account.get('id') not in deleted]
+
+
 def _is_retryable_error(result):
+    if is_account_blocked(result):
+        return False
     if isinstance(result, NetworkError):
         return True
     if not isinstance(result, str):
@@ -1121,7 +1153,8 @@ class Creator:
             password = creator['data']['details']['user']['password']
 
             success, creator_data = await self.login(
-                admin, email, password, reuse_ip=self._reuse_ip(creator, config), task_id=task_id
+                admin, email, password, reuse_ip=self._reuse_ip(creator, config), task_id=task_id,
+                delete_blocked=bool(config.get('delete_blocked'))
             )
             if not success:raise Exception(creator_data)
             creator_name = creator_data['details']['user']['username']
@@ -1140,7 +1173,8 @@ class Creator:
                     Utils.write_log(f'--- Session for {creator_name} expired, refreshing: {e} ---')
                     success, refreshed = await self.login(
                         admin, email, password, reuse_ip=self._reuse_ip(creator, config),
-                        task_id=task_id, stale_token=_auth_token(session.headers)
+                        task_id=task_id, stale_token=_auth_token(session.headers),
+                        delete_blocked=bool(config.get('delete_blocked'))
                     )
                     if not success:
                         return False, f'Could not refresh session for {creator_name}: {refreshed}'
@@ -1170,7 +1204,8 @@ class Creator:
             password = creator['data']['details']['user']['password']
 
             success, _creator = await self.login(
-                admin, email, password, reuse_ip=self._reuse_ip(creator, config), task_id=task_id
+                admin, email, password, reuse_ip=self._reuse_ip(creator, config), task_id=task_id,
+                delete_blocked=bool(config.get('delete_blocked'))
             )
             if not success:
                 raise Exception(_creator)
@@ -1457,7 +1492,8 @@ class Creator:
                         Utils.write_log(f'--- Session for {creator_name} expired, refreshing: {e} ---')
                         success, refreshed = await self.login(
                             admin, email, password, reuse_ip=self._reuse_ip(creator, config),
-                            task_id=task_id, stale_token=_auth_token(session.headers)
+                            task_id=task_id, stale_token=_auth_token(session.headers),
+                            delete_blocked=bool(config.get('delete_blocked'))
                         )
                         if not success:
                             return False, f'Could not refresh session for {creator_name}: {refreshed}'
@@ -1488,7 +1524,7 @@ class Creator:
             return False, f'Error sending messages to users for {creator.get("id")}: {str(e)}'
 
 
-    async def login(self, admin, email, password, reuse_ip=True, task_id=None, category='creators', stale_token=None):
+    async def login(self, admin, email, password, reuse_ip=True, task_id=None, category='creators', stale_token=None, delete_blocked=False):
         lock = _session_lock(f'{admin}:{email}')
         while not lock.acquire(blocking=False):
             await asyncio.sleep(0.5)
@@ -1497,7 +1533,8 @@ class Creator:
             last_error = None
             for attempt in range(1, attempts + 1):
                 success, result = await self._try_login(
-                    admin, email, password, reuse_ip=reuse_ip, task_id=task_id, category=category, stale_token=stale_token
+                    admin, email, password, reuse_ip=reuse_ip, task_id=task_id, category=category,
+                    stale_token=stale_token, delete_blocked=delete_blocked
                 )
                 if success:
                     return success, result
@@ -1510,7 +1547,7 @@ class Creator:
         finally:
             lock.release()
 
-    async def _try_login(self, admin, email, password, reuse_ip=True, task_id=None, category='creators', stale_token=None):
+    async def _try_login(self, admin, email, password, reuse_ip=True, task_id=None, category='creators', stale_token=None, delete_blocked=False):
         async with _http_session() as session:
             try:
                 success, task_status = Utils.check_task_status(task_id) if task_id else (False, 'No task ID provided')
@@ -1525,6 +1562,17 @@ class Creator:
                 creator_id = user.get('id',None)
                 user_data = user.get('data', {})
                 new_user = creator_id is None
+
+                def blocked():
+                    return record_blocked_account(email, creator_id, delete_blocked)
+
+                def accepted(data):
+                    if creator_id:
+                        ok, msg = Utils.set_creator_status(creator_id, 'active')
+                        if not ok:
+                            Utils.write_log(msg)
+                    data['id'] = creator_id
+                    return True, data
 
                 proxies = self._proxy(user_data.get('proxies'), reuse_ip)
                 Utils.write_log(f'--- Logging in {email} with proxy {_redact_proxy(proxies)} ---')
@@ -1551,9 +1599,10 @@ class Creator:
                         proxy=proxies,
                         timeout=60
                     ) as response:
+                        if response.status == 403:
+                            return blocked()
                         if response.status == 200:
-                            user_data['id'] = creator_id
-                            return True, user_data
+                            return accepted(user_data)
                         Utils.write_log(f'Stored session for {email} rejected (HTTP {response.status}); refreshing token')
 
                 if not new_user:
@@ -1572,6 +1621,8 @@ class Creator:
                         proxy=proxies,
                         timeout=120
                     ) as response:
+                        if response.status == 403:
+                            return blocked()
                         if not response.ok:
                             Utils.write_log(
                                 f'could not refresh access token for {email}: '
@@ -1604,8 +1655,7 @@ class Creator:
                             success, msg = Utils.update_creator(creator_id, email, user_data)
                             if not success:raise Exception(msg)
                             await session.close()
-                            user_data['id'] = creator_id
-                            return True, user_data
+                            return accepted(user_data)
 
 
                 session.headers.update(self.headers)
@@ -1618,6 +1668,8 @@ class Creator:
                     proxy=proxies,
                     timeout=120
                 ) as response:
+                    if response.status == 403:
+                        return blocked()
                     if response.status == 401:
                         return False, 'Credentials not correct'
                     if not response.ok:
@@ -1638,6 +1690,8 @@ class Creator:
                         proxy=proxies,
                         timeout=120
                     ) as response:
+                        if response.status == 403:
+                            return blocked()
                         if not response.ok:
                             raise Exception(await _http_failure(response, 'Fetch account credentials'))
                         login_state = await response.json()
@@ -1647,6 +1701,8 @@ class Creator:
                         proxy=proxies,
                         timeout=120
                     ) as response:
+                        if response.status == 403:
+                            return blocked()
                         if not response.ok:
                             raise Exception(await _http_failure(response, 'Fetch current user'))
                         account = await response.json()
@@ -1658,6 +1714,8 @@ class Creator:
                             proxy=proxies,
                             timeout=120
                         ) as response:
+                            if response.status == 403:
+                                return blocked()
                             if not response.ok:
                                 raise Exception(await _http_failure(response, 'Fetch user profile'))
                             profile = await response.json()
@@ -1694,9 +1752,8 @@ class Creator:
                         if not success:
                             raise Exception(msg)
 
-                    user_data['id'] = creator_id
                     await session.close()
-                    return True, user_data
+                    return accepted(user_data)
 
             except NetworkError as e:
                 Utils.write_log(f'Login network error on {email}: {e}')
@@ -1853,6 +1910,12 @@ class _MALOUM:
                 if task_status['status'].lower() in ['cancelled', 'canceled']:
                     break
 
+                if config.get('delete_blocked'):
+                    creators = _drop_deleted_accounts(creators)
+                    scrapers = _drop_deleted_accounts(scrapers)
+                    if not creators:
+                        raise Exception(f'No active creator accounts left on {task_id}; blocked accounts are on the Deleted tab')
+
                 tasks = [
                     Creator().send_messages(admin, task_id, creator, scrapers, config, max_actions)
                     for creator in creators
@@ -1966,6 +2029,11 @@ class _MALOUM:
                 if task_status['status'].lower() in ['cancelled', 'canceled']:
                     break
 
+                if config.get('delete_blocked'):
+                    creators = _drop_deleted_accounts(creators)
+                    if not creators:
+                        raise Exception(f'No active creator accounts left on {task_id}; blocked accounts are on the Deleted tab')
+
                 results = await asyncio.gather(
                     *[Creator().sync_list(admin, task_id, creator, config) for creator in creators],
                     return_exceptions=True
@@ -2032,7 +2100,8 @@ class _MALOUM:
                 reuse_ip=Creator()._reuse_ip(target_scraper, config),
                 task_id=task_id,
                 category='users',
-                stale_token=_auth_token(scraper.get('headers'))
+                stale_token=_auth_token(scraper.get('headers')),
+                delete_blocked=bool(config.get('delete_blocked'))
             )
             if not success:
                 return False, f'Could not refresh session for {email}: {scraper}'
@@ -2084,6 +2153,13 @@ class _MALOUM:
                     raise Exception(task_status)
                 if task_status['status'].lower() in ['cancelled', 'canceled']:
                     break
+
+                if config.get('delete_blocked'):
+                    scrapers = _drop_deleted_accounts(scrapers)
+                    if i >= len(scrapers):
+                        i = 0
+                    if not scrapers:
+                        raise Exception(f'No active scraper accounts left on {task_id}; blocked accounts are on the Deleted tab')
                 
                 target_scraper = scrapers[i]
                 email = target_scraper.get('email') or target_scraper.get('id')
@@ -2093,7 +2169,8 @@ class _MALOUM:
                     target_scraper['data']['details']['user']['password'],
                     reuse_ip=Creator()._reuse_ip(target_scraper, config), 
                     task_id=task_id, 
-                    category='users'
+                    category='users',
+                    delete_blocked=bool(config.get('delete_blocked'))
                 )
 
                 if not success:

@@ -9,6 +9,12 @@
         </div>
         <div class="configs-nav scroll scroll-h">
             <ul>
+                <li class="{% if account_status != 'deleted' %}active{% endif %}">
+                    <a href="{{ url_for('creators', category='users') }}">Active</a>
+                </li>
+                <li class="{% if account_status == 'deleted' %}active{% endif %}">
+                    <a href="{{ url_for('creators', category='users', status='deleted') }}">Deleted</a>
+                </li>
                 <li>
                     <a href="{{ url_for('files', category='users') }}">
                         Add users
@@ -39,7 +45,7 @@
                                 <input type="checkbox" class="checkbox-row">
                             </div>
                             <div class="table-cell badge">
-                                <span class="bg-success">
+                                <span class="{% if account_status == 'deleted' %}bg-danger{% else %}bg-success{% endif %}">
                                     {{creator_details.username|capitalize}}
                                 </span>
                             </div>
@@ -75,11 +81,11 @@
                         <div class="bottom-nav">
                             <div class="sum-total">{{ current_page}} / {{total_creators}}</div>
                             <div class="more-less">
-                                <a href="{{ url_for('creators', page=prev_page, category='users') | safe}}">
+                                <a href="{{ url_for('creators', page=prev_page, category='users', status=none if account_status != 'deleted' else 'deleted') | safe}}">
                                     <i class="fas fa-chevron-left"></i>
                                 </a>
                                 &nbsp; &nbsp;
-                                <a href="{{ url_for('creators', page=next_page, category='users') | safe}}">
+                                <a href="{{ url_for('creators', page=next_page, category='users', status=none if account_status != 'deleted' else 'deleted') | safe}}">
                                     <i class="fas fa-chevron-right"></i>
                                 </a>
                             </div>

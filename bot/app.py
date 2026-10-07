@@ -2,6 +2,10 @@ from app_configs import *
 from utils import Utils
 from actions import Creator,_MALOUM
 
+success, msg = Utils.create_tables()
+if not success:
+    raise Exception(msg)
+
 # Helper function to run async coroutines synchronously
 def run_async_coroutine(coroutine):
     """Run an async coroutine synchronously, handling existing event loops."""
@@ -178,6 +182,9 @@ def creators():
         page = request.args.get('page', 1, type=int)
         per_page = 20
         action = request.args.get('action')
+        account_status = request.args.get('status', 'active')
+        if account_status not in ('active', 'deleted'):
+            account_status = 'active'
 
         page_file = f'{category}.html'
 
@@ -197,13 +204,16 @@ def creators():
                 offset=offset,
                 category=category,
                 constraint=constraint,
-                keyword=item)
+                keyword=item,
+                account_status=account_status)
 
             next_page = page + 1 if page < total_creators / per_page else page
             prev_page = page - 1 if page > 1 else page
             current_page = offset + len(creators)
 
             params = f'action=get-items&item={item}&key={constraint}'
+            if account_status == 'deleted':
+                params += '&status=deleted'
 
             next_page = f'{next_page}&{params}'
             prev_page = f'{prev_page}&{params}'
@@ -215,12 +225,15 @@ def creators():
                                       total_creators=total_creators,
                                       next_page=next_page,
                                       prev_page=prev_page,
-                                      current_page=current_page)
+                                      current_page=current_page,
+                                      account_status=account_status,
+                                      category=category)
             
             Utils.write_log(creators)
             return render_template('view-item.html', action=404)
 
-        success, creators, total_creators = Utils.get_creators(admin=admin, limit=per_page, offset=offset, category=category)
+        success, creators, total_creators = Utils.get_creators(
+            admin=admin, limit=per_page, offset=offset, category=category, account_status=account_status)
     
         if success:
             next_page = page + 1 if page < total_creators / per_page else page
@@ -231,7 +244,9 @@ def creators():
                                   total_creators=total_creators,
                                   next_page=next_page,
                                   prev_page=prev_page,
-                                  current_page=current_page)
+                                  current_page=current_page,
+                                  account_status=account_status,
+                                  category=category)
         else:
             Utils.write_log(creators)
             return render_template('view-item.html', action=404)
@@ -630,7 +645,8 @@ def handle_messages():
             'media_id': data.get('media-id'),
             'admin': admin,
             'time_between': int(data.get('time-between-actions', '3600')),
-            'proxy_flush': True if str(data.get('proxy-flush', 'no')).lower() == 'yes' else False
+            'proxy_flush': True if str(data.get('proxy-flush', 'no')).lower() == 'yes' else False,
+            'delete_blocked': str(data.get('delete-blocked', 'no')).lower() == 'yes'
         }
 
         task_id = str(uuid.uuid4()).upper()[:8]
@@ -704,7 +720,8 @@ def handle_list_sync():
             'selected_creators': data.get('select-creators', []),
             'admin': admin,
             'time_between': int(data.get('time-between-actions', '3600')),
-            'proxy_flush': True if str(data.get('proxy-flush', 'no')).lower() == 'yes' else False
+            'proxy_flush': True if str(data.get('proxy-flush', 'no')).lower() == 'yes' else False,
+            'delete_blocked': str(data.get('delete-blocked', 'no')).lower() == 'yes'
         }
 
         task_id = str(uuid.uuid4()).upper()[:8]
@@ -779,7 +796,8 @@ def scraper():
                 'time_between': int(data.get('time-between-actions', '3600')),
                 'last_activity': int(data.get('last-activity','7')),
                 'max_actions':int(data.get('max-actions', 10)),
-                'proxy_flush': True if str(data.get('proxy-flush', 'no')).lower() == 'yes' else False
+                'proxy_flush': True if str(data.get('proxy-flush', 'no')).lower() == 'yes' else False,
+                'delete_blocked': str(data.get('delete-blocked', 'no')).lower() == 'yes'
             }
 
             task_id = str(uuid.uuid4()).upper()[:8]
