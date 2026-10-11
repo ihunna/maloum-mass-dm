@@ -453,6 +453,7 @@ class _HttpSession:
         used_proxy = proxy or self._proxy
         drop_attempt = 0
         cloudflare_attempt = 0
+        tried_users = set()
         while True:
             try:
                 sent_headers = dict(self.headers)
@@ -464,27 +465,36 @@ class _HttpSession:
                     **kwargs,
                 )
                 wrapped = _HttpResponse(response)
-                if (
-                    wrapped.status == 403
-                    and cloudflare_attempt < _CLOUDFLARE_RETRIES
-                    and not await _is_maloum_auth_block(wrapped)
-                ):
-                    switched = None
+                if wrapped.status == 403 and not await _is_maloum_auth_block(wrapped):
                     if self._rotate_user is not None:
-                        switched = await self._rotate_user(self, _auth_token(sent_headers))
-                    if isinstance(switched, dict) and switched.get('proxy'):
-                        proxy = self._normalize_proxy(switched['proxy'])
-                    cloudflare_attempt += 1
-                    pause = cloudflare_attempt
-                    email = switched.get('email') if isinstance(switched, dict) else None
-                    using = f' using {email}' if email else ''
-                    Utils.write_log(
-                        f'Cloudflare blocked {method} {url} '
-                        f'(retry {cloudflare_attempt}/{_CLOUDFLARE_RETRIES} in {pause:.0f}s){using}'
-                    )
-                    await asyncio.sleep(pause)
-                    await self._ensure_client(proxy, reconnect=True)
-                    continue
+                        switched = await self._rotate_user(self, _auth_token(sent_headers), tried_users)
+                        if not switched:
+                            return wrapped
+                        if switched.get('proxy'):
+                            proxy = self._normalize_proxy(switched['proxy'])
+                        cloudflare_attempt += 1
+                        pause = min(cloudflare_attempt, 3)
+                        total = switched.get('total') or _CLOUDFLARE_RETRIES
+                        attempt = switched.get('attempt') or cloudflare_attempt
+                        email = switched.get('email')
+                        using = f' using {email}' if email else ''
+                        Utils.write_log(
+                            f'Cloudflare blocked {method} {url} '
+                            f'(retry {attempt}/{total} in {pause:.0f}s){using}'
+                        )
+                        await asyncio.sleep(pause)
+                        await self._ensure_client(proxy, reconnect=True)
+                        continue
+                    if cloudflare_attempt < _CLOUDFLARE_RETRIES:
+                        cloudflare_attempt += 1
+                        pause = cloudflare_attempt
+                        Utils.write_log(
+                            f'Cloudflare blocked {method} {url} '
+                            f'(retry {cloudflare_attempt}/{_CLOUDFLARE_RETRIES} in {pause:.0f}s)'
+                        )
+                        await asyncio.sleep(pause)
+                        await self._ensure_client(proxy, reconnect=True)
+                        continue
                 return wrapped
             except (RequestException, OSError) as error:
                 drop_attempt += 1
@@ -536,14 +546,9 @@ class _Throttle:
         if start > now:
             await asyncio.sleep(start - now)
 
-    def throttled(self, response):
+    def throttled(self, response, body=''):
         now = asyncio.get_running_loop().time()
-        try:
-            retry_after = float(response.headers.get('retry-after') or 0)
-        except (TypeError, ValueError):
-            retry_after = 0
-        # Maloum's limits run in 5 second windows
-        pause = max(retry_after, 5.5)
+        pause = _throttle_pause(response, body)
         self.hits += 1
         if self.until <= now:
             self.spacing = min(self.max_spacing, max(self.spacing * 1.5, 0.5))
@@ -552,13 +557,29 @@ class _Throttle:
         self.until = max(self.until, now + pause)
 
 
+def _throttle_pause(response, body=''):
+    try:
+        retry_after = float(response.headers.get('retry-after') or 0)
+    except (TypeError, ValueError):
+        retry_after = 0
+    text = (body or '').lower()
+    if 'sixty-seconds' in text:
+        window = 61
+    elif 'thirty-seconds' in text:
+        window = 31
+    else:
+        # Maloum's other limits run in 5 second windows
+        window = 5.5
+    return max(retry_after, window)
+
+
 async def _throttled(throttle, session, method, url, attempts=6, **kwargs):
     for _ in range(attempts):
         await throttle.wait()
         async with getattr(session, method)(url, **kwargs) as response:
             if response.status != 429:
                 return response
-            throttle.throttled(response)
+            throttle.throttled(response, await response.text())
     return response
 
 # Define a custom exception
@@ -842,6 +863,7 @@ class Creator:
             success, msg = Utils.update_client(client_msg)
 
             auth_headers = scraper.get('headers') or {}
+            trace = f'00-{os.urandom(16).hex()}-{os.urandom(8).hex()}-01'
             headers = {
                 'accept': 'application/json',
                 'accept-language': 'en-US,en;q=0.9',
@@ -855,7 +877,10 @@ class Creator:
                 'sec-fetch-dest': 'empty',
                 'sec-fetch-mode': 'cors',
                 'sec-fetch-site': 'same-site',
+                'traceparent': trace,
                 'user-agent': Utils.generate_user_agent('android', 1),
+                'x-original-traceparent': trace,
+                'x-timezone': 'Europe/Berlin',
             }
 
             async with _http_session(headers=headers, rotate_user=rotate_user) as session:
@@ -940,7 +965,15 @@ class Creator:
                             total_existing += len(existing_ids)
 
 
-                semaphore = asyncio.Semaphore(3)  # allow max 3 requests at once
+                semaphore = asyncio.Semaphore(1)
+                comment_throttle = _Throttle(
+                    'comment lookups',
+                    report=lambda msg: (
+                        Utils.write_log(f'--- {msg} ---'),
+                        Utils.update_client({'msg': msg, 'status': 'success', 'type': 'message'}),
+                    ),
+                    spacing=1.0,
+                )
                 async def process_post(post):
                     try:
                         nonlocal total_creators, total_existing, candidate_users, valid_users
@@ -978,47 +1011,53 @@ class Creator:
                                 'user-agent': Utils.generate_user_agent('android', 1)
                             })
 
-                            # prevent too many concurrent requests
+                            # one comment page at a time; a 429 waits out Maloum's window and retries
                             async with semaphore:
-                                # random delay before hitting the endpoint
-                                await asyncio.sleep(random.uniform(3, 5))
-
-                                async with session.get(
-                                    f'https://api.maloum.com/posts/{post_id}/comments',
-                                    params=params,
-                                    proxy=proxy_box['value'],
-                                    timeout=120
-                                ) as response:
-                                    if not response.ok:
-                                        raise Exception(await _http_failure(response, f'Get comments for post {post_id}'))
-
-                                    data = await response.json()
-                                    comments, _next = data.get('data', []), data.get('next')
-                                    comment_count -= len(comments)
-
-                                    creators = [c for c in comments if c.get('user', {}).get('isCreator', False)]
-                                    
-                                    for comment in comments:
-                                        u = comment.get('user')
-                                        if not u:
+                                data = None
+                                for _ in range(6):
+                                    await comment_throttle.wait()
+                                    async with session.get(
+                                        f'https://api.maloum.com/posts/{post_id}/comments',
+                                        params=params,
+                                        proxy=proxy_box['value'],
+                                        timeout=120
+                                    ) as response:
+                                        if response.status == 429:
+                                            comment_throttle.throttled(response, await response.text())
                                             continue
+                                        if not response.ok:
+                                            raise Exception(await _http_failure(response, f'Get comments for post {post_id}'))
+                                        data = await response.json()
+                                        break
+                                if data is None:
+                                    raise Exception(f'Get comments for post {post_id} failed (HTTP 429) after 6 attempts')
+                                comments, _next = data.get('data', []), data.get('next')
+                                comment_count -= len(comments)
 
-                                        user = {
-                                            "_id": u["_id"],
-                                            "username": u["username"],
-                                            "commented_at": comment.get("createdAt")
-                                        }
+                                creators = [c for c in comments if c.get('user', {}).get('isCreator', False)]
 
-                                        if not u.get('isCreator', True):
-                                            async with lock:
-                                                # if len(valid_users) >= count:
-                                                #     await flush_candidates()
-                                                #     return True, f'{post.get("commentCount")} processed for post {post_id}'
+                                for comment in comments:
+                                    u = comment.get('user')
+                                    if not u:
+                                        continue
 
-                                                candidate_users.append(user)
-                                                # if len(candidate_users) >= BATCH_SIZE:
-                                                #     await flush_candidates()
-                                    if not _next:break
+                                    user = {
+                                        "_id": u["_id"],
+                                        "username": u["username"],
+                                        "commented_at": comment.get("createdAt")
+                                    }
+
+                                    if not u.get('isCreator', True):
+                                        async with lock:
+                                            # if len(valid_users) >= count:
+                                            #     await flush_candidates()
+                                            #     return True, f'{post.get("commentCount")} processed for post {post_id}'
+
+                                            candidate_users.append(user)
+                                            # if len(candidate_users) >= BATCH_SIZE:
+                                            #     await flush_candidates()
+                                if not _next:
+                                    break
 
                         await flush_candidates()
 
@@ -1898,18 +1937,40 @@ class _ScraperRotation:
         self.active_session = None
         self.proxy = None
         self.proxy_box = None
+        self._auth_ids = {}
         self._lock = asyncio.Lock()
 
     def activate(self, target, session_data):
         self.active_target = target
         self.active_session = session_data
+        self._remember(target, session_data)
 
     def _email(self):
         target = self.active_target or {}
         session_data = self.active_session or {}
         return target.get('email') or session_data.get('id') or target.get('id')
 
-    async def _login_next(self):
+    @staticmethod
+    def _account_key(target):
+        if not target:
+            return None
+        return target.get('id') or target.get('email')
+
+    def _remember(self, target, session_data):
+        auth = _auth_token((session_data or {}).get('headers'))
+        key = self._account_key(target) or self._account_key(session_data)
+        if auth and key:
+            self._auth_ids[auth] = key
+
+    def _result(self, proxy, email, tried):
+        return {
+            'proxy': proxy,
+            'email': email,
+            'attempt': len(tried),
+            'total': len(self.pool['scrapers']),
+        }
+
+    async def _login_next(self, tried):
         scrapers = self.pool['scrapers']
         if len(scrapers) < 2:
             return None
@@ -1922,8 +1983,12 @@ class _ScraperRotation:
                 return None
             target = scrapers[index]
             email = target.get('email') or target.get('id')
+            account_id = self._account_key(target)
+            if account_id in tried:
+                continue
             password = ((target.get('data') or {}).get('details') or {}).get('user', {}).get('password')
             if not email or not password:
+                tried.add(account_id)
                 Utils.write_log(f'Cloudflare retry skipped {email or index}: no stored password')
                 continue
             success, logged_in = await creator.login(
@@ -1936,16 +2001,20 @@ class _ScraperRotation:
                 delete_blocked=bool(self.config.get('delete_blocked')),
             )
             if not success:
+                tried.add(account_id)
                 Utils.write_log(f'Cloudflare retry skipped {email}: {logged_in}')
                 continue
             auth = _auth_token((logged_in or {}).get('headers'))
             if not auth:
+                tried.add(account_id)
                 Utils.write_log(f'Cloudflare retry skipped {email}: login returned no authorization')
                 continue
             proxy = creator._proxy(
                 logged_in.get('proxies'),
                 creator._reuse_ip(target, self.config),
             )
+            tried.add(account_id)
+            self._remember(target, logged_in)
             self.pool['i'] = index
             self.active_target = target
             self.active_session = logged_in
@@ -1955,12 +2024,19 @@ class _ScraperRotation:
             return logged_in, proxy, email
         return None
 
-    async def __call__(self, session, blocked_auth):
+    async def __call__(self, session, blocked_auth, tried=None):
         async with self._lock:
+            if tried is None:
+                tried = set()
+            blocked_id = self._auth_ids.get(blocked_auth)
+            if blocked_id:
+                tried.add(blocked_id)
             current = _auth_token(session.headers)
-            if blocked_auth and current and current != blocked_auth:
-                return {'proxy': self.proxy, 'email': self._email()}
-            switched = await self._login_next()
+            current_id = self._account_key(self.active_target) or self._account_key(self.active_session)
+            if blocked_auth and current and current != blocked_auth and current_id and current_id not in tried:
+                tried.add(current_id)
+                return self._result(self.proxy, self._email(), tried)
+            switched = await self._login_next(tried)
             if not switched:
                 return None
             logged_in, proxy, email = switched
@@ -1969,7 +2045,7 @@ class _ScraperRotation:
                 session.headers['authorization'] = auth
             session.headers['user-agent'] = Utils.generate_user_agent('android', 1)
             session.cookie_jar.replace_cookies(logged_in.get('cookies') or {})
-            return {'proxy': proxy, 'email': email}
+            return self._result(proxy, email, tried)
 
 
 class _MALOUM:
