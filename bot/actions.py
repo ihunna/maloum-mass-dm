@@ -133,6 +133,8 @@ def _format_network_error(error, method=None, url=None, proxy=None, timeout=None
 
 
 _DROP_RETRIES = 2
+# Cloudflare 403s on a scrape request are sent again this many times before the scrape accepts the failure.
+_CLOUDFLARE_RETRIES = 3
 # the request never reached the server, so any method is safe to resend
 _NOT_SENT_CODES = ('curl: (5)', 'curl: (7)', 'curl: (35)', 'curl: (60)', 'curl: (97)')
 # the connection died mid-request; resend reads plus POST and PATCH
@@ -309,6 +311,25 @@ class _CookieJar:
         matched.update(_cookies_as_dict(cookies))
         return matched
 
+    def replace_cookies(self, cookies):
+        data = dict(cookies or {})
+        self._pending = dict(data)
+        client = self._client
+        if client is None:
+            return
+        jar = getattr(client, 'cookies', None)
+        if jar is not None and hasattr(jar, 'clear'):
+            jar.clear()
+        elif jar is not None:
+            try:
+                from curl_cffi.requests import Cookies
+                client.cookies = Cookies()
+            except Exception:
+                return
+        if data and getattr(client, 'cookies', None) is not None:
+            client.cookies.update(data)
+        self._pending = {}
+
     def snapshot(self):
         cookies = dict(self._pending)
         if self._client is not None:
@@ -385,12 +406,13 @@ class _RequestContext:
 class _HttpSession:
     """curl_cffi session with browser TLS/HTTP2 fingerprints, aiohttp-style API."""
 
-    def __init__(self, headers=None):
+    def __init__(self, headers=None, rotate_user=None):
         self.headers = _Headers(headers or {})
         self.cookie_jar = _CookieJar()
         self._client = None
         self._proxy = None
         self._lock = asyncio.Lock()
+        self._rotate_user = rotate_user
 
     async def __aenter__(self):
         return self
@@ -429,31 +451,48 @@ class _HttpSession:
         timeout = kwargs.pop('timeout', DEFAULT_TIMEOUT)
         await self._ensure_client(proxy)
         used_proxy = proxy or self._proxy
-        for attempt in range(1, _DROP_RETRIES + 2):
+        drop_attempt = 0
+        cloudflare_attempt = 0
+        while True:
             try:
+                sent_headers = dict(self.headers)
                 response = await self._client.request(
                     method,
                     url,
-                    headers=dict(self.headers),
+                    headers=sent_headers,
                     timeout=timeout,
                     **kwargs,
                 )
                 wrapped = _HttpResponse(response)
                 if (
                     wrapped.status == 403
-                    and attempt <= _DROP_RETRIES
+                    and cloudflare_attempt < _CLOUDFLARE_RETRIES
                     and not await _is_maloum_auth_block(wrapped)
                 ):
-                    await asyncio.sleep(attempt)
+                    switched = None
+                    if self._rotate_user is not None:
+                        switched = await self._rotate_user(self, _auth_token(sent_headers))
+                    if isinstance(switched, dict) and switched.get('proxy'):
+                        proxy = self._normalize_proxy(switched['proxy'])
+                    cloudflare_attempt += 1
+                    pause = cloudflare_attempt
+                    email = switched.get('email') if isinstance(switched, dict) else None
+                    using = f' using {email}' if email else ''
+                    Utils.write_log(
+                        f'Cloudflare blocked {method} {url} '
+                        f'(retry {cloudflare_attempt}/{_CLOUDFLARE_RETRIES} in {pause:.0f}s){using}'
+                    )
+                    await asyncio.sleep(pause)
                     await self._ensure_client(proxy, reconnect=True)
                     continue
                 return wrapped
             except (RequestException, OSError) as error:
-                if attempt > _DROP_RETRIES or not _is_dropped_connection(error, method):
+                drop_attempt += 1
+                if drop_attempt > _DROP_RETRIES or not _is_dropped_connection(error, method):
                     raise NetworkError(_format_network_error(
                         error, method, url, used_proxy, timeout
                     )) from error
-                await asyncio.sleep(attempt)
+                await asyncio.sleep(drop_attempt)
                 await self._ensure_client(proxy, reconnect=True)
 
     def get(self, url, **kwargs):
@@ -472,7 +511,7 @@ class _HttpSession:
 
 
 def _http_session(**kwargs):
-    return _HttpSession(headers=kwargs.get('headers'))
+    return _HttpSession(headers=kwargs.get('headers'), rotate_user=kwargs.get('rotate_user'))
 
 
 class _Throttle:
@@ -785,7 +824,7 @@ class Creator:
             except Exception as e:
                 return False, f'Error saving media ID {post_id} for creator {creator_id}: {str(e)}'
 
-    async def scrape_users(self, scraper, admin, task_id, count=50, limit=50, offset=0, last_activity=7, delete_blocked=False):
+    async def scrape_users(self, scraper, admin, task_id, count=50, limit=50, offset=0, last_activity=7, delete_blocked=False, rotate_user=None):
         try:
             if not isinstance(scraper, dict) or not scraper.get('id'):
                 return False, f'Scraper is not logged in: {scraper}'
@@ -819,9 +858,14 @@ class Creator:
                 'user-agent': Utils.generate_user_agent('android', 1),
             }
 
-            async with _http_session(headers=headers) as session:
+            async with _http_session(headers=headers, rotate_user=rotate_user) as session:
                 # session.cookie_jar.update_cookies(scraper.get('cookies'))
                 proxies = self._proxy(scraper.get('proxies'), scraper.get('reuse_ip', True))
+                proxy_box = {'value': proxies}
+                if rotate_user is not None:
+                    rotate_user.proxy = proxies
+                    rotate_user.proxy_box = proxy_box
+                    rotate_user.active_session = scraper
 
                 #Set random preferences
                 cat = random.choice(self.categories)
@@ -836,7 +880,7 @@ class Creator:
                 async with session.patch(
                     'https://api.maloum.com/users/current/preferences',
                     json=json_data,
-                    proxy=proxies,
+                    proxy=proxy_box['value'],
                     timeout=120
                 ) as response:
                     if response.status == 401:
@@ -851,7 +895,7 @@ class Creator:
                 async with session.get(
                     'https://api.maloum.com/content/discovery',
                     params={'limit': f'30', 'dsc_r': self.generate_sensor_data('dsc_r')},
-                    proxy=proxies,
+                    proxy=proxy_box['value'],
                     timeout=90
                 ) as response:
                     if response.status == 401:
@@ -942,7 +986,7 @@ class Creator:
                                 async with session.get(
                                     f'https://api.maloum.com/posts/{post_id}/comments',
                                     params=params,
-                                    proxy=proxies,
+                                    proxy=proxy_box['value'],
                                     timeout=120
                                 ) as response:
                                     if not response.ok:
@@ -1005,9 +1049,10 @@ class Creator:
 
                 if not valid_users and (total_creators > 0 or total_existing > 0):
                     raise Exception(f'No users found | Because {total_creators} creators were skipped and {total_existing} existing users already exist in the database')
+                finished = rotate_user.active_session if rotate_user is not None and rotate_user.active_session else scraper
                 if not valid_users:
-                    return False, f'No valid users found for {scraper["id"]}'
-                return True, f'Scraped {len(valid_users)} users by {scraper["id"]}'
+                    return False, f'No valid users found for {finished.get("id")}'
+                return True, f'Scraped {len(valid_users)} users by {finished.get("id")}'
 
         except (SessionExpired, AccountBlockedError):
             raise
@@ -1841,6 +1886,92 @@ class Creator:
             return False, error
     
 
+class _ScraperRotation:
+    """On a Cloudflare retry, log in as the next scraper account and hand that session back to _request."""
+
+    def __init__(self, admin, task_id, config, pool):
+        self.admin = admin
+        self.task_id = task_id
+        self.config = config
+        self.pool = pool
+        self.active_target = None
+        self.active_session = None
+        self.proxy = None
+        self.proxy_box = None
+        self._lock = asyncio.Lock()
+
+    def activate(self, target, session_data):
+        self.active_target = target
+        self.active_session = session_data
+
+    def _email(self):
+        target = self.active_target or {}
+        session_data = self.active_session or {}
+        return target.get('email') or session_data.get('id') or target.get('id')
+
+    async def _login_next(self):
+        scrapers = self.pool['scrapers']
+        if len(scrapers) < 2:
+            return None
+        start = self.pool['i']
+        index = start
+        creator = Creator()
+        for _ in range(len(scrapers) - 1):
+            index = index + 1 if index < len(scrapers) - 1 else 0
+            if index == start:
+                return None
+            target = scrapers[index]
+            email = target.get('email') or target.get('id')
+            password = ((target.get('data') or {}).get('details') or {}).get('user', {}).get('password')
+            if not email or not password:
+                Utils.write_log(f'Cloudflare retry skipped {email or index}: no stored password')
+                continue
+            success, logged_in = await creator.login(
+                self.admin,
+                target['email'],
+                password,
+                reuse_ip=creator._reuse_ip(target, self.config),
+                task_id=self.task_id,
+                category='users',
+                delete_blocked=bool(self.config.get('delete_blocked')),
+            )
+            if not success:
+                Utils.write_log(f'Cloudflare retry skipped {email}: {logged_in}')
+                continue
+            auth = _auth_token((logged_in or {}).get('headers'))
+            if not auth:
+                Utils.write_log(f'Cloudflare retry skipped {email}: login returned no authorization')
+                continue
+            proxy = creator._proxy(
+                logged_in.get('proxies'),
+                creator._reuse_ip(target, self.config),
+            )
+            self.pool['i'] = index
+            self.active_target = target
+            self.active_session = logged_in
+            self.proxy = proxy
+            if self.proxy_box is not None:
+                self.proxy_box['value'] = proxy
+            return logged_in, proxy, email
+        return None
+
+    async def __call__(self, session, blocked_auth):
+        async with self._lock:
+            current = _auth_token(session.headers)
+            if blocked_auth and current and current != blocked_auth:
+                return {'proxy': self.proxy, 'email': self._email()}
+            switched = await self._login_next()
+            if not switched:
+                return None
+            logged_in, proxy, email = switched
+            auth = _auth_token(logged_in.get('headers'))
+            if auth:
+                session.headers['authorization'] = auth
+            session.headers['user-agent'] = Utils.generate_user_agent('android', 1)
+            session.cookie_jar.replace_cookies(logged_in.get('cookies') or {})
+            return {'proxy': proxy, 'email': email}
+
+
 class _MALOUM:
     def __init__(self):
         self.proxies = Utils.load_proxies()
@@ -2156,31 +2287,37 @@ class _MALOUM:
             else:
                 Utils.write_log(f'Task | {task_id} finished operation')
 
-    async def _scrape_with_refresh(self, admin, task_id, config, target_scraper, scraper, count, last_activity, offset):
+    async def _scrape_with_refresh(self, admin, task_id, config, target_scraper, scraper, count, last_activity, offset, rotate_user=None):
         try:
             return await Creator().scrape_users(
                 scraper, admin, task_id, count=count, last_activity=last_activity, offset=offset,
-                delete_blocked=bool(config.get('delete_blocked'))
+                delete_blocked=bool(config.get('delete_blocked')),
+                rotate_user=rotate_user,
             )
         except SessionExpired as error:
-            email = target_scraper['email']
+            target = rotate_user.active_target if rotate_user is not None and rotate_user.active_target else target_scraper
+            current = rotate_user.active_session if rotate_user is not None and rotate_user.active_session else scraper
+            email = target['email']
             Utils.write_log(f'--- Session for {email} expired, refreshing: {error} ---')
             success, scraper = await Creator().login(
                 admin,
                 email,
-                target_scraper['data']['details']['user']['password'],
-                reuse_ip=Creator()._reuse_ip(target_scraper, config),
+                target['data']['details']['user']['password'],
+                reuse_ip=Creator()._reuse_ip(target, config),
                 task_id=task_id,
                 category='users',
-                stale_token=_auth_token(scraper.get('headers')),
+                stale_token=_auth_token(current.get('headers')),
                 delete_blocked=bool(config.get('delete_blocked'))
             )
             if not success:
                 return False, f'Could not refresh session for {email}: {scraper}'
+            if rotate_user is not None:
+                rotate_user.activate(target, scraper)
             try:
                 return await Creator().scrape_users(
                     scraper, admin, task_id, count=count, last_activity=last_activity, offset=offset,
-                    delete_blocked=bool(config.get('delete_blocked'))
+                    delete_blocked=bool(config.get('delete_blocked')),
+                    rotate_user=rotate_user,
                 )
             except SessionExpired as error:
                 return False, f'Session for {email} was rejected again after relogin: {error}'
@@ -2218,7 +2355,9 @@ class _MALOUM:
 
             Utils.write_log(f'=== Scraping started for {task_id} ===')
 
-            offset, i = 0, 0
+            pool = {'scrapers': scrapers, 'i': 0}
+            rotation = _ScraperRotation(admin, task_id, config, pool)
+            offset = 0
             count = config.get('max_actions',10)
             last_activity = config.get('last_activity',7)
 
@@ -2229,12 +2368,16 @@ class _MALOUM:
                 if task_status['status'].lower() in ['cancelled', 'canceled']:
                     break
 
+                scrapers = pool['scrapers']
+                i = pool['i']
                 if config.get('delete_blocked'):
                     scrapers = _drop_deleted_accounts(scrapers)
+                    pool['scrapers'] = scrapers
                     if i >= len(scrapers):
                         i = 0
                     if not scrapers:
                         raise Exception(f'No active scraper accounts left on {task_id}; blocked accounts are on the Deleted tab')
+                pool['i'] = i
                 
                 target_scraper = scrapers[i]
                 email = target_scraper.get('email') or target_scraper.get('id')
@@ -2254,13 +2397,15 @@ class _MALOUM:
                         client_msg = {'msg': f'Error scraping users on {task_id}: {result}', 'status': 'error', 'type': 'message'}
                         Utils.update_client(client_msg)
                         Utils.write_log(f'=== {result} ===')
-                    i = i + 1 if i < len(scrapers) - 1 else 0
+                    pool['i'] = i + 1 if i < len(scrapers) - 1 else 0
                     await asyncio.sleep(5)
                     continue
 
+                rotation.activate(target_scraper, scraper)
                 try:
                     success, result = await self._scrape_with_refresh(
-                        admin, task_id, config, target_scraper, scraper, count, last_activity, offset
+                        admin, task_id, config, target_scraper, scraper, count, last_activity, offset,
+                        rotate_user=rotation,
                     )
                 except AccountBlockedError as error:
                     success, result = False, str(error)
@@ -2270,7 +2415,9 @@ class _MALOUM:
                         client_msg = {'msg': f'Error scraping users on {task_id}: {result}', 'status': 'error', 'type': 'message'}
                         Utils.update_client(client_msg)
                         Utils.write_log(f'=== {result} ===')
-                    i = i + 1 if i < len(scrapers) - 1 else 0
+                    i = pool['i']
+                    scrapers = pool['scrapers']
+                    pool['i'] = i + 1 if i < len(scrapers) - 1 else 0
                     await asyncio.sleep(5)
                     continue
 
@@ -2300,7 +2447,9 @@ class _MALOUM:
                     await asyncio.sleep(sleep_time)
 
                 offset += count if offset < 400 else 0
-                i = i + 1 if i < len(scrapers) - 1 else 0
+                i = pool['i']
+                scrapers = pool['scrapers']
+                pool['i'] = i + 1 if i < len(scrapers) - 1 else 0
 
 
         except Cancelled as error:
