@@ -63,19 +63,34 @@
     </style>
     
     
-    {%if action == 'start-messaging'%}
+    {%if action in ['start-messaging', 'start-follow-up']%}
+        {% set follow_up = action == 'start-follow-up' %}
         <section class="add-message">
             <div class="holder form-holder">
                     <div class="alt-tab">
-                        <a href="{{url_for('scraper')}}">Scraper <i class="fas fa-arrow-right"></i></a>
+                        {%if follow_up%}
+                            <a href="{{url_for('messages', action='start-messaging')}}">Messanger <i class="fas fa-arrow-right"></i></a>
+                        {%else%}
+                            <a href="{{url_for('messages', action='start-follow-up')}}">Follow up <i class="fas fa-arrow-right"></i></a>
+                        {%endif%}
+                        <a href="{{url_for('scraper')}}" style="margin-left: 10px;">Scraper <i class="fas fa-arrow-right"></i></a>
                         <a href="{{url_for('messages', action='sync-lists')}}" style="margin-left: 10px;">Lists <i class="fas fa-arrow-right"></i></a>
                     </div>
+                    {%if follow_up%}
+                    <form action="" id="follow-up-form" data-action="Create follow-up"
+                        data-action-url="{{ url_for('handle_follow_ups') }}" data-action-message="Creating follow-up..."
+                        data-next-action-url="{{ url_for('tasks') }}">
+                    <h3 class="form-header">
+                        Fill the form to follow up chats the bot already started, once the last message is old enough.
+                    </h3>
+                    {%else%}
                     <form action="" id="messages-form" data-action="Create message" 
                         data-action-url="{{ url_for('handle_messages') }}" data-action-message="Creating message..." 
                         data-next-action-url="{{ url_for('tasks') }}">
                     <h3 class="form-header">
                         Fill the form to start operation for all added creators, add more messages if needed.
                     </h3>
+                    {%endif%}
                     <div class="u-settings input-container">
                         <div class="input-container flex radio">
                             <span style="padding: 0; margin: 0 auto 0 0;">
@@ -117,7 +132,7 @@
                         </div>
                         <div class="input-container max-actions">
                             <input type="number" id="max-actions" name="max-actions" value="10" max="50" autofocus tocomplete="delay" required>
-                            <label for="max-actions">Number of messages per interation</label>
+                            <label for="max-actions">{%if follow_up%}Number of follow-ups per iteration{%else%}Number of messages per interation{%endif%}</label>
                         </div>
                         <div class="input-container flex radio">
                             <span style="padding: 0; margin: 0 auto 0 0;">
@@ -145,6 +160,25 @@
                                 <label for="delete-blocked-no">No</label>
                             </div>
                         </div>
+                        {%if follow_up%}
+                        <div class="input-container flex radio">
+                            <span style="padding: 0; margin: 0 auto 0 0;">
+                                Only follow up users who are online
+                            </span>
+                            <div class="radio-box">
+                                <input type="radio" class="online-only" id="online-only-yes" name="online-only" value="yes" checked>
+                                <label for="online-only-yes">Yes</label>
+                            </div>
+                            <div class="radio-box">
+                                <input type="radio" class="online-only" id="online-only-no" name="online-only" value="no">
+                                <label for="online-only-no">No</label>
+                            </div>
+                        </div>
+                        <div class="input-container resend-after-hours">
+                            <input type="number" id="resend-after-hours" name="resend-after-hours" value="24" min="1" tocomplete="delay" required>
+                            <label for="resend-after-hours">Hours since last message</label>
+                        </div>
+                        {%endif%}
                     </div>
                     <div class="message-holder">
                         <div class="input-container flex radio">
@@ -176,6 +210,12 @@
                                 <input type="radio" class="captions" id="message-caption-universal" name="message-caption-source" value="universal" checked>
                                 <label for="message-caption-universal">Use universal caption</label>
                             </div>
+                            {%if follow_up%}
+                            <div class="radio-box">
+                                <input type="radio" class="captions" id="message-caption-pool" name="message-caption-source" value="pool">
+                                <label for="message-caption-pool">Use follow-up pool</label>
+                            </div>
+                            {%endif%}
                         </div>
                         <div class="input-container">
                             <select name="message-caption" id="message-caption" required>
@@ -185,6 +225,12 @@
                                 {%endfor%}
                             </select>
                         </div>
+                        {%if follow_up%}
+                        <div class="input-container" style="display: none;">
+                            <textarea class="scroll scroll-v" name="follow-up-pool" id="follow-up-pool" rows="10"></textarea>
+                            <label for="follow-up-pool">Follow-up captions (one per line)</label>
+                        </div>
+                        {%endif%}
                         <div class="input-container flex radio">
                             <span style="padding: 0; margin: 0 auto 0 0;">
                                 Use media?
@@ -277,14 +323,24 @@
                         if (radio.classList.contains('captions')){
                             const captionSelect = messageHolder.querySelector('[name="message-caption"][id="message-caption"]');
                             const captionSelectHolder = captionSelect.parentNode;
-                            if (this.value == 'creator'){
-                                captionSelect.value = '';
-                                captionSelect.removeAttribute('required');
-                                captionSelectHolder.style.display = 'none';
-                            }else{
+                            if (this.value == 'universal'){
                                 captionSelect.setAttribute('required','required');
                                 captionSelectHolder.style.display = '';
                                 captionSelect.value = '';
+                            }else{
+                                captionSelect.value = '';
+                                captionSelect.removeAttribute('required');
+                                captionSelectHolder.style.display = 'none';
+                            }
+                            const poolInput = messageHolder.querySelector('#follow-up-pool');
+                            if (poolInput){
+                                const usePool = this.value == 'pool';
+                                poolInput.parentNode.style.display = usePool ? '' : 'none';
+                                if (usePool){
+                                    poolInput.setAttribute('required','required');
+                                }else{
+                                    poolInput.removeAttribute('required');
+                                }
                             }
                         }else if (radio.classList.contains('creators')){
                             const creatorsSelect = messageHolder.querySelector('[name="select-creators"]');
@@ -336,6 +392,7 @@
             <div class="holder form-holder">
                     <div class="alt-tab">
                         <a href="{{url_for('messages', action='start-messaging')}}">Messanger <i class="fas fa-arrow-right"></i></a>
+                        <a href="{{url_for('messages', action='start-follow-up')}}" style="margin-left: 10px;">Follow up <i class="fas fa-arrow-right"></i></a>
                     </div>
                     <form action="" id="lists-form" data-action="Sync lists"
                         data-action-url="{{ url_for('handle_list_sync') }}" data-action-message="Starting list sync..."
@@ -444,6 +501,7 @@
             <div class="holder form-holder">
                     <div class="alt-tab">
                         <a href="{{url_for('messages', action='start-messaging')}}">Messanger <i class="fas fa-arrow-right"></i></a>
+                        <a href="{{url_for('messages', action='start-follow-up')}}" style="margin-left: 10px;">Follow up <i class="fas fa-arrow-right"></i></a>
                     </div>
                     <form action="" id="scraper-form" data-action="Scrape accounts" 
                         data-action-url="{{ url_for('scraper') }}" data-action-message="Staring scraper..." 

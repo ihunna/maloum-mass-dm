@@ -81,7 +81,12 @@ def _parse_iso(value):
     try:
         parsed = datetime.fromisoformat(str(value).replace('Z', '+00:00'))
     except ValueError:
-        return None
+        parsed = None
+    if parsed is None:
+        try:
+            parsed = datetime.strptime(str(value)[:19], '%Y-%m-%d %H:%M:%S')
+        except (TypeError, ValueError):
+            return None
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
@@ -1677,6 +1682,261 @@ class Creator:
         except Exception as e:
             return False, f'Error sending messages to users for {creator.get("id")}: {str(e)}'
 
+    def _resend_decision(self, last_message, stored_chat, creator_id, hours):
+        last_message = last_message if isinstance(last_message, dict) else {}
+        sender_id = last_message.get('senderId') or last_message.get('user_id')
+        if sender_id == creator_id:
+            stored_id = stored_chat.get('last_message_id')
+            message_id = last_message.get('_id') or last_message.get('id')
+            if stored_id and message_id and message_id != stored_id:
+                return True, 'last sent message was manual'
+            reference = last_message.get('sentAt') or last_message.get('createdAt') or last_message.get('created_at')
+        else:
+            reference = stored_chat.get('created_at')
+
+        sent_at = _parse_iso(reference)
+        if sent_at is None:
+            return True, 'no previous sent message found'
+        age_hours = (datetime.now(timezone.utc) - sent_at).total_seconds() / 3600
+        if age_hours < hours:
+            return False, f'last sent {age_hours:.1f}h ago < {hours}h'
+        return True, f'last sent {age_hours:.1f}h ago'
+
+    def _message_content(self, caption, has_media, media, is_paid, price):
+        content = {'type': 'text', 'text': caption}
+        if not isinstance(media, dict):
+            media = {}
+        media_id = media.get('uploadId')
+        if has_media and media_id:
+            content = {
+                'type': 'media' if not (is_paid and price > 0) else 'chat_product',
+                'media': [{
+                    'mediaId': media.get('uploadId'),
+                    'type': media.get('type'),
+                    'width': media.get('width'),
+                    'height': media.get('height'),
+                }],
+                'text': caption,
+            }
+            if is_paid and price > 0:
+                content['priceNet'] = price
+        return content
+
+    async def send_follow_ups(self, admin, task_id, creator, config, max_actions):
+        try:
+            success, task_status = Utils.check_task_status(task_id)
+            if not success:
+                raise Exception(task_status)
+            if task_status['status'].lower() in ['cancelled', 'canceled']:
+                return False, 'Task canceled'
+
+            if not creator.get('data', {}):
+                raise Exception('creator data not available')
+
+            email = creator['data']['details']['user']['email']
+            password = creator['data']['details']['user']['password']
+            success, creator_data = await self.login(
+                admin, email, password, reuse_ip=self._reuse_ip(creator, config), task_id=task_id,
+                delete_blocked=bool(config.get('delete_blocked'))
+            )
+            if not success:
+                raise Exception(creator_data)
+
+            creator_name = creator_data['details']['user']['username']
+            creator_id = creator_data['details']['user']['_id']
+            creator_internal_id = creator['id']
+            hours = max(1, int(config.get('resend_after_hours') or 24))
+            online_only = config.get('online_only', True)
+            caption = config.get('caption', '')
+            caption_source = config.get('caption_source', 'creator')
+            has_media = config.get('has_media', False)
+            media = creator_data.get('media') if isinstance(creator_data.get('media'), dict) else {}
+            is_paid = config.get('cost_type', 'free') != 'free'
+            try:
+                price = float(config.get('price') or 0)
+            except (TypeError, ValueError):
+                price = 0
+
+            captions = []
+            if caption_source == 'creator':
+                captions_file = os.path.join(configs_folder, creator_internal_id, 'captions.txt')
+                if not os.path.isfile(captions_file):
+                    raise Exception(f'Captions file does not exist for {creator_name}')
+                with open(captions_file, 'r', encoding='utf-8') as f:
+                    captions = [line.strip() for line in f.readlines() if line.strip()]
+                if not captions:
+                    raise ValueError('Captions cannot be empty')
+            elif caption_source == 'pool':
+                captions = [line for line in config.get('caption_pool') or [] if line]
+                if not captions:
+                    raise ValueError('Follow-up caption pool can not be empty')
+
+            success, candidates = Utils.get_resend_candidates(creator_internal_id, hours, limit=max_actions * 5)
+            if not success:
+                raise Exception(candidates)
+            if not candidates:
+                return True, f'No chats older than {hours}h to follow up for {creator_name}'
+
+            client_msg = {'msg': f'Checking {len(candidates)} chats for follow-ups by {creator_name}', 'status': 'success', 'type': 'message'}
+            Utils.update_client(client_msg)
+            Utils.write_log(f'--- Checking {len(candidates)} chats for follow-ups by {creator_name} ---')
+
+            sent_follow_ups, failed_follow_ups, session_refreshed = 0, 0, False
+            online_unknown = False
+            async with _http_session() as session:
+                session.headers.update(creator_data.get('headers'))
+                session.headers.update(self._trace_headers())
+                session.cookie_jar.update_cookies(creator_data.get('cookies'))
+                proxies = creator_data.get('proxies') or self._proxy()
+                throttle = _Throttle(
+                    f'follow-ups for {creator_name}',
+                    report=lambda msg: (Utils.write_log(f'--- {msg} ---'), Utils.update_client({'msg': msg, 'status': 'success', 'type': 'message'}))
+                )
+
+                for user in candidates:
+                    if sent_follow_ups >= max_actions:
+                        break
+                    username = user.get('username') or 'unknown'
+                    recipient_id = user.get('id')
+                    try:
+                        success, task_status = Utils.check_task_status(task_id)
+                        if not success:
+                            raise Exception(task_status)
+                        if task_status['status'].lower() in ['cancelled', 'canceled']:
+                            return False, 'Task canceled'
+
+                        success, stored_chat = Utils.get_chat_for_recipient(creator_internal_id, recipient_id)
+                        if not success:
+                            raise Exception(stored_chat)
+                        if not stored_chat:
+                            continue
+                        chat_id = stored_chat['chat_id']
+
+                        async with await _throttled(
+                            throttle, session, 'get',
+                            f'https://api.maloum.com/chats/{chat_id}',
+                            proxy=proxies,
+                            timeout=60
+                        ) as response:
+                            if response.status == 401:
+                                raise SessionExpired(await _http_failure(response, f'Fetch chat {chat_id}'))
+                            if not response.ok:
+                                failure = await _http_failure(response, f'Fetch chat {chat_id}')
+                                Utils.write_log(f'--- Skipping {username}; {failure} ---')
+                                Utils.update_client({'msg': failure, 'status': 'error', 'type': 'message'})
+                                failed_follow_ups += 1
+                                continue
+                            chat = await response.json()
+                        if not isinstance(chat, dict):
+                            Utils.write_log(f'--- Skipping {username}; chat {chat_id} was not an object ---')
+                            failed_follow_ups += 1
+                            continue
+
+                        partner = chat.get('chatPartner') if isinstance(chat.get('chatPartner'), dict) else {}
+                        if online_only:
+                            online = next((partner.get(key) for key in ('isOnline', 'online', 'is_online') if isinstance(partner, dict) and key in partner), None)
+                            if online is None and not online_unknown:
+                                online_unknown = True
+                                Utils.write_log(f'--- Online status is not on {creator_name} chats; following up without it ---')
+                            elif online is False:
+                                Utils.write_log(f'--- Skipping {username}; not online ---')
+                                continue
+
+                        last_message = chat.get('lastRelevantMessage') if isinstance(chat.get('lastRelevantMessage'), dict) else {}
+                        if not last_message.get('senderId') and not last_message.get('sentAt'):
+                            async with await _throttled(
+                                throttle, session, 'get',
+                                f'https://api.maloum.com/chats/{chat_id}/messages',
+                                params={'limit': 20},
+                                proxy=proxies,
+                                timeout=60
+                            ) as response:
+                                if response.status == 401:
+                                    raise SessionExpired(await _http_failure(response, f'Check messages for chat {chat_id}'))
+                                if response.ok:
+                                    history = await response.json()
+                                    if isinstance(history, dict):
+                                        history = history.get('data') or history.get('messages') or []
+                                    messages = [item for item in history if isinstance(item, dict)] if isinstance(history, list) else []
+                                    dated = [item for item in messages if item.get('sentAt') or item.get('createdAt') or item.get('created_at')]
+                                    last_message = max(
+                                        dated,
+                                        key=lambda item: item.get('sentAt') or item.get('createdAt') or item.get('created_at')
+                                    ) if dated else (messages[-1] if messages else {})
+
+                        should_send, reason = self._resend_decision(last_message, stored_chat, creator_id, hours)
+                        if not should_send:
+                            Utils.write_log(f'--- Skipping {username}; {reason} ---')
+                            continue
+
+                        chosen_caption = random.choice(captions) if caption_source in ('creator', 'pool') else caption
+                        json_data = {
+                            'content': self._message_content(chosen_caption, has_media, media, is_paid, price),
+                            'optimisticMessageId': str(uuid.uuid4()),
+                        }
+                        await asyncio.sleep(random.randint(5, 10))
+                        async with await _throttled(
+                            throttle, session, 'post',
+                            f'https://api.maloum.com/chats/{chat_id}/messages',
+                            json=json_data,
+                            proxy=proxies,
+                            timeout=90
+                        ) as response:
+                            if response.status == 401:
+                                raise SessionExpired(await _http_failure(response, f'Send follow-up for chat {chat_id}'))
+                            if not response.ok:
+                                failure = await _http_failure(response, f'Send follow-up to {username}')
+                                Utils.write_log(f'--- {failure} ---')
+                                Utils.update_client({'msg': failure, 'status': 'error', 'type': 'message'})
+                                failed_follow_ups += 1
+                                continue
+                            try:
+                                sent = await response.json()
+                            except Exception:
+                                sent = {}
+                        sent_id = json_data['optimisticMessageId']
+                        if isinstance(sent, dict):
+                            sent_id = sent.get('_id') or sent.get('id') or sent_id
+                        success, msg = Utils.update_last_sent(chat_id, sent_id, chosen_caption)
+                        if not success:
+                            Utils.write_log(msg)
+
+                        Utils.write_log(f'=== Followed up {username} by {creator_name} ({reason}) ===')
+                        Utils.update_client({'msg': f'Followed up {username} by {creator_name} ({reason})', 'status': 'success', 'type': 'message'})
+                        sent_follow_ups += 1
+
+                    except AccountBlockedError:
+                        raise
+                    except SessionExpired as e:
+                        if session_refreshed:
+                            return False, f'Session for {creator_name} was rejected again after relogin: {e}'
+                        Utils.write_log(f'--- Session for {creator_name} expired, refreshing: {e} ---')
+                        success, refreshed = await self.login(
+                            admin, email, password, reuse_ip=self._reuse_ip(creator, config),
+                            task_id=task_id, stale_token=_auth_token(session.headers),
+                            delete_blocked=bool(config.get('delete_blocked'))
+                        )
+                        if not success:
+                            return False, f'Could not refresh session for {creator_name}: {refreshed}'
+                        session.headers.update(refreshed.get('headers') or {})
+                        session.headers.update(self._trace_headers())
+                        session.cookie_jar.update_cookies(refreshed.get('cookies') or {})
+                        session_refreshed = True
+                        continue
+                    except Exception as e:
+                        Utils.write_log(f'Failed to follow up {username}: {e}')
+                        Utils.update_client({'msg': f'Failed to follow up user {username}: {e}', 'status': 'error', 'type': 'message'})
+                        failed_follow_ups += 1
+                        continue
+
+            if sent_follow_ups > 0:
+                return True, f'Sent {sent_follow_ups} follow-ups by {creator_name}'
+            if failed_follow_ups > 0:
+                return False, f'{creator_name} could not send any follow-ups ({failed_follow_ups} failed)'
+            return True, f'{creator_name} had no chats ready for a follow-up'
+        except Exception as e:
+            return False, f'Error sending follow-ups for {creator.get("id")}: {str(e)}'
+
 
     async def login(self, admin, email, password, reuse_ip=True, task_id=None, category='creators', stale_token=None, delete_blocked=False):
         lock = _session_lock(f'{admin}:{email}')
@@ -2130,8 +2390,8 @@ class _MALOUM:
 
             Utils.push_task_update(task, task_status, task_msg)
 
-    async def start_messaging(self, task, max_actions=20):
-        task_status, task_msg = 'failed', f'Started messaging for {task["id"]}'
+    async def start_messaging(self, task, max_actions=20, follow_up=False):
+        task_status, task_msg = 'failed', f'Started {"follow-ups" if follow_up else "messaging"} for {task["id"]}'
         try:
             admin = task['admin']
             task_id = task['id']
@@ -2157,25 +2417,29 @@ class _MALOUM:
                         raise Exception(msg)
                     creators.extend(msg)
 
-            success, scrapers, total_scrapers = Utils.get_creators(admin=admin, limit=100, category='users')
-            if not success:raise Exception(scrapers)
+            scrapers = []
+            if not follow_up:
+                success, scrapers, total_scrapers = Utils.get_creators(admin=admin, limit=100, category='users')
+                if not success:raise Exception(scrapers)
 
-            len_scrapers = len(scrapers)
-            if len_scrapers < total_scrapers:
-                for i in range(total_scrapers - len_scrapers):
-                    offset = len_scrapers + i
-                    success, msg, total_scrapers = Utils.get_creators(admin=admin, limit=100, offset=offset, category='users')
-                    if not success:
-                        raise Exception(msg)
-                    scrapers.extend(msg)
+                len_scrapers = len(scrapers)
+                if len_scrapers < total_scrapers:
+                    for i in range(total_scrapers - len_scrapers):
+                        offset = len_scrapers + i
+                        success, msg, total_scrapers = Utils.get_creators(admin=admin, limit=100, offset=offset, category='users')
+                        if not success:
+                            raise Exception(msg)
+                        scrapers.extend(msg)
 
             if config.get('proxy_flush'):
-                flushed = Creator().apply_proxy_flush(creators) + Creator().apply_proxy_flush(scrapers)
+                flushed = Creator().apply_proxy_flush(creators)
+                if not follow_up:
+                    flushed += Creator().apply_proxy_flush(scrapers)
                 Utils.write_log(f'Proxy flush enabled: reuse_ip disabled for {flushed} accounts with stored proxies')
                 client_msg = {'msg': f'Proxy flush enabled: reuse_ip disabled for {flushed} accounts with stored proxies', 'status': 'success', 'type': 'message'}
                 Utils.update_client(client_msg)
 
-            Utils.write_log(f'=== Messaging started for {task_id} ===')
+            Utils.write_log(f'=== {"Follow-ups" if follow_up else "Messaging"} started for {task_id} ===')
 
             while True:
                 success, task_status = Utils.check_task_status(task_id)
@@ -2186,14 +2450,21 @@ class _MALOUM:
 
                 if config.get('delete_blocked'):
                     creators = _drop_deleted_accounts(creators)
-                    scrapers = _drop_deleted_accounts(scrapers)
+                    if not follow_up:
+                        scrapers = _drop_deleted_accounts(scrapers)
                     if not creators:
                         raise Exception(f'No active creator accounts left on {task_id}; blocked accounts are on the Deleted tab')
 
-                tasks = [
-                    Creator().send_messages(admin, task_id, creator, scrapers, config, max_actions)
-                    for creator in creators
-                ]
+                if follow_up:
+                    tasks = [
+                        Creator().send_follow_ups(admin, task_id, creator, config, max_actions)
+                        for creator in creators
+                    ]
+                else:
+                    tasks = [
+                        Creator().send_messages(admin, task_id, creator, scrapers, config, max_actions)
+                        for creator in creators
+                    ]
                 results = await asyncio.gather(*tasks, return_exceptions=True)
 
                 for item in results:
@@ -2207,15 +2478,17 @@ class _MALOUM:
                     if was_removed_from_pool(result):
                         continue
                     if not success:
-                        client_msg = {'msg': f'Error messaging users on {task_id}: {result}', 'status': 'error', 'type': 'message'}
+                        label = 'Error sending follow-ups' if follow_up else 'Error messaging users'
+                        client_msg = {'msg': f'{label} on {task_id}: {result}', 'status': 'error', 'type': 'message'}
                         success, msg = Utils.update_client(client_msg)
                     else:
-                        client_msg = {'msg': f'Success messaging users on {task_id}: {result}', 'status': 'success', 'type': 'message'}
+                        label = 'Follow-ups' if follow_up else 'Success messaging users'
+                        client_msg = {'msg': f'{label} on {task_id}: {result}', 'status': 'success', 'type': 'message'}
                         success, msg = Utils.update_client(client_msg)
 
                     Utils.write_log(f'=== {result} ===')
 
-                wait_message = f'Waiting for {time_message[str(time_between)]} before sending another batch of messages'
+                wait_message = f'Waiting for {time_message[str(time_between)]} before sending another batch of {"follow-ups" if follow_up else "messages"}'
                 Utils.write_log(wait_message)
 
                 client_msg = {'msg': wait_message, 'status': 'success', 'type': 'message'}
@@ -2245,8 +2518,9 @@ class _MALOUM:
         except Exception as e:
             Utils.write_log(e)
             task_status = 'failed'
-            task_msg = f'Error in messaging | {task_id}: {e}'
-            client_msg = {'msg': f'Error in messaging | {task_id}: {e}', 'status': 'error', 'type': 'message'}
+            kind = 'follow-ups' if follow_up else 'messaging'
+            task_msg = f'Error in {kind} | {task_id}: {e}'
+            client_msg = {'msg': f'Error in {kind} | {task_id}: {e}', 'status': 'error', 'type': 'message'}
             success, msg = Utils.update_client(client_msg)
             if not success:
                 Utils.write_log(msg)

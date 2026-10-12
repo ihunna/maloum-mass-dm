@@ -198,6 +198,11 @@ class Utils:
             if 'status' not in creator_columns:
                 cursor.execute("ALTER TABLE creators ADD COLUMN status TEXT DEFAULT 'active'")
 
+            cursor.execute("PRAGMA table_info(messages)")
+            message_columns = [column[1] for column in cursor.fetchall()]
+            if 'last_message_id' not in message_columns:
+                cursor.execute("ALTER TABLE messages ADD COLUMN last_message_id TEXT")
+
             conn.commit()
             
             success,msg = True, 'Tables created'
@@ -799,6 +804,64 @@ class Utils:
             return False, str(error)
         finally:
             conn.close()
+
+    @staticmethod
+    def get_resend_candidates(creator_id, hours, limit=50):
+        try:
+            conn = sqlite3.connect(db_file)
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT recipient_id, recipient_name
+                FROM messages
+                WHERE creator_id = ?
+                GROUP BY recipient_id
+                HAVING MAX(created_at) <= datetime('now', ?)
+                ORDER BY RANDOM()
+                LIMIT ?
+            """, (creator_id, f'-{int(hours)} hours', limit))
+            rows = cursor.fetchall()
+            conn.close()
+            return True, [{'id': row[0], 'username': row[1]} for row in rows]
+        except Exception as error:
+            return False, str(error)
+
+    @staticmethod
+    def get_chat_for_recipient(creator_id, recipient_id):
+        try:
+            conn = sqlite3.connect(db_file)
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT id, last_message_id, created_at
+                FROM messages
+                WHERE creator_id = ? AND recipient_id = ?
+                ORDER BY created_at DESC
+                LIMIT 1
+            """, (creator_id, recipient_id))
+            row = cursor.fetchone()
+            conn.close()
+            if row is None:
+                return True, None
+            return True, {'chat_id': row[0], 'last_message_id': row[1], 'created_at': row[2]}
+        except Exception as error:
+            return False, str(error)
+
+    @staticmethod
+    def update_last_sent(chat_id, last_message_id, caption):
+        success, msg = False, ''
+        conn = sqlite3.connect(db_file)
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                'UPDATE messages SET last_message_id = ?, caption = ?, created_at = CURRENT_TIMESTAMP WHERE id = ?',
+                (last_message_id, caption, chat_id)
+            )
+            conn.commit()
+            success, msg = True, 'Message updated successfully'
+        except Exception as error:
+            success, msg = False, f'Error updating last sent message: {error}'
+        finally:
+            conn.close()
+            return success, msg
 
     @staticmethod
     def get_chat_recipient(chat_id):
