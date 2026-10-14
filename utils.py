@@ -203,6 +203,18 @@ class Utils:
             if 'last_message_id' not in message_columns:
                 cursor.execute("ALTER TABLE messages ADD COLUMN last_message_id TEXT")
 
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS post_comments (
+                    creator_id TEXT NOT NULL,
+                    post_id TEXT NOT NULL,
+                    comment_id TEXT,
+                    comment TEXT,
+                    task_id TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (creator_id, post_id)
+                )
+            """)
+
             conn.commit()
             
             success,msg = True, 'Tables created'
@@ -859,6 +871,42 @@ class Utils:
             success, msg = True, 'Message updated successfully'
         except Exception as error:
             success, msg = False, f'Error updating last sent message: {error}'
+        finally:
+            conn.close()
+            return success, msg
+
+    @staticmethod
+    def get_commented_post_ids(creator_id, post_ids):
+        if not post_ids:
+            return True, set()
+        try:
+            conn = sqlite3.connect(db_file)
+            cursor = conn.cursor()
+            placeholders = ','.join('?' for _ in post_ids)
+            cursor.execute(
+                f'SELECT post_id FROM post_comments WHERE creator_id = ? AND post_id IN ({placeholders})',
+                (creator_id, *post_ids)
+            )
+            rows = cursor.fetchall()
+            conn.close()
+            return True, {row[0] for row in rows}
+        except Exception as error:
+            return False, str(error)
+
+    @staticmethod
+    def add_post_comment(creator_id, post_id, comment_id, comment, task_id=None):
+        success, msg = False, ''
+        conn = sqlite3.connect(db_file)
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                'INSERT OR IGNORE INTO post_comments (creator_id, post_id, comment_id, comment, task_id) VALUES (?, ?, ?, ?, ?)',
+                (creator_id, post_id, comment_id, comment, task_id)
+            )
+            conn.commit()
+            success, msg = True, 'Comment saved'
+        except Exception as error:
+            success, msg = False, f'Error saving post comment: {error}'
         finally:
             conn.close()
             return success, msg

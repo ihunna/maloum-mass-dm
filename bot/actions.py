@@ -191,6 +191,16 @@ async def _http_failure(response, action):
     return f'{action} failed (HTTP {response.status}): {snippet}'
 
 
+def _comments_disabled(body):
+    try:
+        data = json.loads(body or '')
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    return data.get('internalCode') == 2404005 or 'unable to create comment' in str(data.get('message', '')).lower()
+
+
 def is_account_blocked(result):
     text = str(result or '')
     return was_removed_from_pool(text) or f'blocked by {app_name}' in text
@@ -1389,6 +1399,10 @@ class Creator:
                     captions = [line.strip() for line in f.readlines()]
                     if not captions:
                         raise ValueError('Captions cannot be empty')
+            elif caption_source == 'pool':
+                captions = [line for line in config.get('caption_pool') or [] if line]
+                if not captions:
+                    raise ValueError('Message pool can not be empty')
 
             # NOTE: scraping is handled elsewhere now; this function only pulls from DB
             offset = creator_data.get('message_offset', 0)
@@ -1567,7 +1581,7 @@ class Creator:
                                     continue
 
                         # Prepare message
-                        chosen_caption = random.choice(captions) if caption_source == 'creator' else caption
+                        chosen_caption = random.choice(captions) if caption_source in ('creator', 'pool') else caption
 
                         content = {
                             'type': 'text',
@@ -1936,6 +1950,210 @@ class Creator:
             return True, f'{creator_name} had no chats ready for a follow-up'
         except Exception as e:
             return False, f'Error sending follow-ups for {creator.get("id")}: {str(e)}'
+
+    @staticmethod
+    def _post_author_id(post):
+        for key in ('user', 'creator', 'author'):
+            value = post.get(key)
+            if isinstance(value, dict) and value.get('_id'):
+                return value['_id']
+        return post.get('userId') or post.get('creatorId')
+
+    async def send_comments(self, admin, task_id, creator, config, max_actions):
+        try:
+            success, task_status = Utils.check_task_status(task_id)
+            if not success:
+                raise Exception(task_status)
+            if task_status['status'].lower() in ['cancelled', 'canceled']:
+                return False, 'Task canceled'
+
+            if not creator.get('data', {}):
+                raise Exception('creator data not available')
+
+            email = creator['data']['details']['user']['email']
+            password = creator['data']['details']['user']['password']
+            success, creator_data = await self.login(
+                admin, email, password, reuse_ip=self._reuse_ip(creator, config), task_id=task_id,
+                delete_blocked=bool(config.get('delete_blocked'))
+            )
+            if not success:
+                raise Exception(creator_data)
+
+            creator_name = creator_data['details']['user']['username']
+            creator_id = creator_data['details']['user']['_id']
+            creator_internal_id = creator['id']
+            caption = config.get('caption', '')
+            caption_source = config.get('caption_source', 'creator')
+
+            captions = []
+            if caption_source == 'creator':
+                captions_file = os.path.join(configs_folder, creator_internal_id, 'captions.txt')
+                if not os.path.isfile(captions_file):
+                    raise Exception(f'Captions file does not exist for {creator_name}')
+                with open(captions_file, 'r', encoding='utf-8') as f:
+                    captions = [line.strip() for line in f.readlines() if line.strip()]
+                if not captions:
+                    raise ValueError('Captions cannot be empty')
+            elif caption_source == 'pool':
+                captions = [line for line in config.get('caption_pool') or [] if line]
+                if not captions:
+                    raise ValueError('Comment pool can not be empty')
+            elif not caption.strip():
+                raise ValueError('Universal caption can not be empty')
+
+            def report(msg, status='success'):
+                Utils.write_log(f'--- {msg} ---')
+                Utils.update_client({'msg': msg, 'status': status, 'type': 'message'})
+
+            sent_comments, failed_comments, session_refreshed = 0, 0, False
+            async with _http_session() as session:
+                session.headers.update(creator_data.get('headers'))
+                session.headers.update(self._trace_headers())
+                session.cookie_jar.update_cookies(creator_data.get('cookies'))
+                proxies = creator_data.get('proxies') or self._proxy()
+                throttle = _Throttle(f'comments by {creator_name}', report=report, spacing=1.0)
+
+                while True:
+                    try:
+                        if self.categories:
+                            cat = random.choice(self.categories)
+                            async with session.patch(
+                                'https://api.maloum.com/users/current/preferences',
+                                json={'categories': [cat.get('_id')], 'sexualPreferences': ['141400000000000000002000']},
+                                proxy=proxies,
+                                timeout=120
+                            ) as response:
+                                if response.status == 401:
+                                    raise SessionExpired(await _http_failure(response, 'Set preferences'))
+                                if not response.ok:
+                                    raise Exception(await _http_failure(response, 'Set preferences'))
+
+                        async with session.get(
+                            'https://api.maloum.com/content/discovery',
+                            params={'limit': '30', 'dsc_r': self.generate_sensor_data('dsc_r')},
+                            proxy=proxies,
+                            timeout=90
+                        ) as response:
+                            if response.status == 401:
+                                raise SessionExpired(await _http_failure(response, 'Get discovery posts'))
+                            if not response.ok:
+                                raise Exception(await _http_failure(response, 'Get discovery posts'))
+                            body = await response.json()
+                        break
+                    except SessionExpired as e:
+                        if session_refreshed:
+                            return False, f'Session for {creator_name} was rejected again after relogin: {e}'
+                        Utils.write_log(f'--- Session for {creator_name} expired, refreshing: {e} ---')
+                        success, refreshed = await self.login(
+                            admin, email, password, reuse_ip=self._reuse_ip(creator, config),
+                            task_id=task_id, stale_token=_auth_token(session.headers),
+                            delete_blocked=bool(config.get('delete_blocked'))
+                        )
+                        if not success:
+                            return False, f'Could not refresh session for {creator_name}: {refreshed}'
+                        session.headers.update(refreshed.get('headers') or {})
+                        session.headers.update(self._trace_headers())
+                        session.cookie_jar.update_cookies(refreshed.get('cookies') or {})
+                        session_refreshed = True
+
+                posts = body.get('data', []) if isinstance(body, dict) else []
+                posts = [post for post in posts if isinstance(post, dict) and post.get('_id')]
+                posts = [post for post in posts if self._post_author_id(post) != creator_id]
+                success, done = Utils.get_commented_post_ids(creator_internal_id, [post['_id'] for post in posts])
+                if not success:
+                    raise Exception(done)
+                posts = [post for post in posts if post['_id'] not in done]
+                if not posts:
+                    return True, f'No new discovery posts for {creator_name} to comment on'
+
+                report(f'Commenting on up to {min(max_actions, len(posts))} of {len(posts)} discovery posts by {creator_name}')
+
+                comments_off_authors = set()
+                skipped_comments_off = 0
+                for post in posts:
+                    if sent_comments >= max_actions:
+                        break
+                    post_id = post['_id']
+                    author_id = self._post_author_id(post)
+                    if author_id and author_id in comments_off_authors:
+                        skipped_comments_off += 1
+                        continue
+                    try:
+                        success, task_status = Utils.check_task_status(task_id)
+                        if not success:
+                            raise Exception(task_status)
+                        if task_status['status'].lower() in ['cancelled', 'canceled']:
+                            return False, 'Task canceled'
+
+                        comment = random.choice(captions) if caption_source in ('creator', 'pool') else caption
+                        if sent_comments:
+                            await asyncio.sleep(random.randint(5, 10))
+                        async with await _throttled(
+                            throttle, session, 'post',
+                            f'https://api.maloum.com/posts/{post_id}/comments',
+                            json={'text': comment},
+                            proxy=proxies,
+                            timeout=90
+                        ) as response:
+                            if response.status == 401:
+                                raise SessionExpired(await _http_failure(response, f'Comment on post {post_id}'))
+                            if response.status == 400 and _comments_disabled(await response.text()):
+                                if author_id:
+                                    comments_off_authors.add(author_id)
+                                skipped_comments_off += 1
+                                success, msg = Utils.add_post_comment(creator_internal_id, post_id, None, None, task_id)
+                                if not success:
+                                    Utils.write_log(msg)
+                                Utils.write_log(f'--- Skipping post {post_id}; its creator turned comments off ---')
+                                continue
+                            if not response.ok:
+                                report(await _http_failure(response, f'Comment on post {post_id} by {creator_name}'), 'error')
+                                failed_comments += 1
+                                continue
+                            try:
+                                sent = await response.json()
+                            except Exception:
+                                sent = {}
+                        comment_id = (sent.get('_id') or sent.get('id')) if isinstance(sent, dict) else None
+                        success, msg = Utils.add_post_comment(creator_internal_id, post_id, comment_id, comment, task_id)
+                        if not success:
+                            Utils.write_log(msg)
+
+                        Utils.write_log(f'=== Commented on post {post_id} by {creator_name} ===')
+                        Utils.update_client({'msg': f'Commented on post {post_id} by {creator_name}', 'status': 'success', 'type': 'message'})
+                        sent_comments += 1
+
+                    except AccountBlockedError:
+                        raise
+                    except SessionExpired as e:
+                        if session_refreshed:
+                            return False, f'Session for {creator_name} was rejected again after relogin: {e}'
+                        Utils.write_log(f'--- Session for {creator_name} expired, refreshing: {e} ---')
+                        success, refreshed = await self.login(
+                            admin, email, password, reuse_ip=self._reuse_ip(creator, config),
+                            task_id=task_id, stale_token=_auth_token(session.headers),
+                            delete_blocked=bool(config.get('delete_blocked'))
+                        )
+                        if not success:
+                            return False, f'Could not refresh session for {creator_name}: {refreshed}'
+                        session.headers.update(refreshed.get('headers') or {})
+                        session.headers.update(self._trace_headers())
+                        session.cookie_jar.update_cookies(refreshed.get('cookies') or {})
+                        session_refreshed = True
+                        continue
+                    except Exception as e:
+                        report(f'Failed to comment on post {post_id} by {creator_name}: {e}', 'error')
+                        failed_comments += 1
+                        continue
+
+            skipped = f', skipped {skipped_comments_off} with comments off' if skipped_comments_off else ''
+            if sent_comments > 0:
+                return True, f'Posted {sent_comments} comments by {creator_name}{skipped}'
+            if failed_comments > 0:
+                return False, f'{creator_name} could not post any comments ({failed_comments} failed{skipped})'
+            return True, f'{creator_name} had no posts open for comments{skipped}'
+        except Exception as e:
+            return False, f'Error commenting for {creator.get("id")}: {str(e)}'
 
 
     async def login(self, admin, email, password, reuse_ip=True, task_id=None, category='creators', stale_token=None, delete_blocked=False):
@@ -2543,6 +2761,99 @@ class _MALOUM:
             else:
                 Utils.write_log(f'Task | {task_id} finished operation')
 
+
+    async def start_commenting(self, task, max_actions=10):
+        task_status, task_msg = 'failed', f'Started commenting for {task["id"]}'
+        task_id = task['id']
+        try:
+            admin = task['admin']
+            config = task['config']
+            selected_creators = config.get('selected_creators', [])
+            time_between = config.get('time_between', 3600)
+            time_message = {
+                '60': '1 minute', '120': '2 minutes', '180': '3 minutes', '300': '5 minutes',
+                '600': '10 minutes', '1200': '20 minutes', '1800': '30 minutes', '3600': '1 hour',
+                '7200': '2 hours', '10800': '3 hours', '21600': '6 hours', '86400': '24 hours'
+            }
+
+            success, creators, total_creators = Utils.get_creators(admin=admin, limit=100, selected_creators=selected_creators)
+            if not success:raise Exception(creators)
+            while len(creators) < total_creators:
+                success, page, total_creators = Utils.get_creators(admin=admin, limit=100, offset=len(creators), selected_creators=selected_creators)
+                if not success:raise Exception(page)
+                if not page:break
+                creators.extend(page)
+
+            if config.get('proxy_flush'):
+                flushed = Creator().apply_proxy_flush(creators)
+                Utils.write_log(f'Proxy flush enabled: reuse_ip disabled for {flushed} accounts with stored proxies')
+                Utils.update_client({'msg': f'Proxy flush enabled: reuse_ip disabled for {flushed} accounts with stored proxies', 'status': 'success', 'type': 'message'})
+
+            Utils.write_log(f'=== Commenting started for {task_id} ===')
+
+            while True:
+                success, task_status = Utils.check_task_status(task_id)
+                if not success:raise Exception(task_status)
+                if task_status['status'].lower() in ['cancelled', 'canceled']:
+                    break
+
+                if config.get('delete_blocked'):
+                    creators = _drop_deleted_accounts(creators)
+                    if not creators:
+                        raise Exception(f'No active creator accounts left on {task_id}; blocked accounts are on the Deleted tab')
+
+                results = await asyncio.gather(
+                    *[Creator().send_comments(admin, task_id, creator, config, max_actions) for creator in creators],
+                    return_exceptions=True
+                )
+
+                for item in results:
+                    if isinstance(item, Exception):
+                        success, result = False, str(item)
+                    elif isinstance(item, (tuple, list)) and len(item) == 2:
+                        success, result = item
+                    else:
+                        success, result = False, str(item)
+
+                    if result == 'Task canceled' or was_removed_from_pool(result):
+                        continue
+                    label = 'Comments' if success else 'Error commenting'
+                    Utils.update_client({'msg': f'{label} on {task_id}: {result}', 'status': 'success' if success else 'error', 'type': 'message'})
+                    Utils.write_log(f'=== {result} ===')
+
+                wait_message = f'Waiting for {time_message.get(str(time_between), f"{time_between} seconds")} before commenting again'
+                Utils.write_log(wait_message)
+                Utils.update_client({'msg': wait_message, 'status': 'success', 'type': 'message'})
+
+                sleep_time = 10
+                for _ in range(int(time_between / sleep_time)):
+                    success, task_status = Utils.check_task_status(task_id)
+                    if not success:raise Exception(task_status)
+                    if task_status['status'].lower() in ['cancelled', 'canceled']:
+                        raise Cancelled(task_status)
+                    await asyncio.sleep(sleep_time)
+
+        except Cancelled:
+            pass
+
+        except Exception as e:
+            Utils.write_log(e)
+            task_status = 'failed'
+            task_msg = f'Error in commenting | {task_id}: {e}'
+            Utils.update_client({'msg': task_msg, 'status': 'error', 'type': 'message'})
+            success, msg = Utils.update_task(task_id, {'status': task_status, 'message': task_msg})
+            task_data = task
+            task_data.update({'updated': str(datetime.now()), 'status': task_status})
+            success, msg = Utils.update_client({'task': task_data, 'type': 'task'})
+            if not success:Utils.write_log(msg)
+
+        finally:
+            task_status = task_status['status'] if isinstance(task_status, dict) else task_status
+            if task_status.lower() in ['cancelled', 'canceled']:
+                Utils.update_client({'msg': f'Task | {task_id} has been cancelled', 'status': 'error', 'type': 'message'})
+                Utils.write_log(f'Task | {task_id} was stopped')
+            else:
+                Utils.write_log(f'Task | {task_id} finished operation')
 
     async def start_list_sync(self, task):
         task_status, task_msg = 'failed', f'Started list sync for {task["id"]}'

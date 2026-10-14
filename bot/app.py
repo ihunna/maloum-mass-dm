@@ -524,7 +524,7 @@ def messages():
 
         admin = session['USER']['id']
 
-        if action in ['start-messaging', 'start-follow-up']:
+        if action in ['start-messaging', 'start-follow-up', 'start-commenting']:
             success, creators, total_creators = Utils.get_creators(admin=admin)
             
             if not success:
@@ -638,6 +638,7 @@ def handle_messages():
             'price': data.get('message-price'),
             'caption': str(data.get('message-caption', '')).replace('\n', ''),
             'caption_source': data.get('message-caption-source'),
+            'caption_pool': [line.strip() for line in str(data.get('follow-up-pool', '')).splitlines() if line.strip()],
             'creators_source': data.get('creators-source'),
             'cost_type': data.get('message-cost-type', 'free'),
             'selected_creators': data.get('select-creators', []),
@@ -648,6 +649,8 @@ def handle_messages():
             'proxy_flush': True if str(data.get('proxy-flush', 'no')).lower() == 'yes' else False,
             'delete_blocked': str(data.get('delete-blocked', 'no')).lower() == 'yes'
         }
+        if message_data['caption_source'] == 'pool' and not message_data['caption_pool']:
+            return jsonify({'msg': 'Add at least one message to the pool'}), 400
 
         task_id = str(uuid.uuid4()).upper()[:8]
         task_data = {
@@ -763,6 +766,85 @@ def handle_follow_ups():
             if not success:
                 Utils.write_log(msg)
             Utils.write_log('Follow-up task successfully created')
+            return jsonify({'msg': 'Task successfully started'}), 200
+        return jsonify({'msg': f'Could not start task {task_id}'}), 400
+
+    except Exception as error:
+        Utils.write_log(str(error))
+        abort(500)
+
+
+@app.route('/start-commenting', methods=['POST'])
+@login_required
+def handle_comments():
+    try:
+        admin = session['USER']['id']
+
+        if len(Utils.load_proxies()) < 1:
+            return jsonify({'msg': 'Proxies must not be empty'}), 400
+
+        success, tasks, _ = Utils.get_tasks(admin=admin, constraint='type', keyword='comments')
+        if not success:
+            raise Exception(tasks)
+        running_task = tasks[0] if len(tasks) > 0 else {'status': None}
+
+        if running_task['status'] in ['running', 'pending']:
+            success, msg = Utils.update_client({
+                'msg': 'Please wait for the current comment task to finish or stop it before creating another',
+                'status': 'error',
+                'type': 'message'
+            })
+            if not success:
+                Utils.write_log(msg)
+            return jsonify({'msg': 'A comment task is already running. Please wait until it finishes.'}), 400
+
+        data = request.get_json()
+        comment_data = {
+            'caption': str(data.get('message-caption', '')).replace('\n', ''),
+            'caption_source': data.get('message-caption-source'),
+            'caption_pool': [line.strip() for line in str(data.get('follow-up-pool', '')).splitlines() if line.strip()],
+            'creators_source': data.get('creators-source'),
+            'selected_creators': data.get('select-creators', []),
+            'admin': admin,
+            'time_between': int(data.get('time-between-actions', '3600')),
+            'proxy_flush': str(data.get('proxy-flush', 'no')).lower() == 'yes',
+            'delete_blocked': str(data.get('delete-blocked', 'no')).lower() == 'yes',
+        }
+        if comment_data['caption_source'] == 'pool' and not comment_data['caption_pool']:
+            return jsonify({'msg': 'Add at least one comment to the pool'}), 400
+        if comment_data['caption_source'] == 'universal' and not comment_data['caption'].strip():
+            return jsonify({'msg': 'Choose a caption for the comments'}), 400
+
+        task_id = str(uuid.uuid4()).upper()[:8]
+        task_data = {
+            'id': task_id,
+            'admin': admin,
+            'status': 'pending',
+            'action_count': data.get('action-count', 1),
+            'type': 'comments',
+            'message': f'Creating task on {admin}',
+            'config': comment_data
+        }
+        success, msg = Utils.add_task(task_id, task_data)
+        if not success:
+            raise Exception(msg)
+
+        def run_start_commenting():
+            run_async_coroutine(_MALOUM().start_commenting(task_data, max_actions=int(data.get('max-actions', 10))))
+
+        task = socketio.start_background_task(run_start_commenting)
+
+        if task.is_alive():
+            success, msg = Utils.update_task(task_id, {
+                'status': 'running',
+                'message': 'Started commenting on posts'
+            })
+            if not success:
+                Utils.write_log(msg)
+            success, msg = Utils.update_client({'msg': f'Task {task_id} successfully created', 'status': 'success', 'type': 'message'})
+            if not success:
+                Utils.write_log(msg)
+            Utils.write_log('Comment task successfully created')
             return jsonify({'msg': 'Task successfully started'}), 200
         return jsonify({'msg': f'Could not start task {task_id}'}), 400
 

@@ -23,7 +23,7 @@
                 <div class="table-body" id="messages-tasks-table-body">
                     {# First, render running 'messages' and 'scraper' tasks #}
                     {% for task in tasks %}
-                        {% if task.type in ['messages', 'follow-ups', 'scraper', 'lists'] and task.status|lower == 'running' %}
+                        {% if task.type in ['messages', 'follow-ups', 'comments', 'scraper', 'lists'] and task.status|lower == 'running' %}
                             <div data-action-url="{{ url_for('tasks',action='view-item',task=task.id) }}" 
                                 class="table-row" data-item="{{task.id}}" data-action-target="{{task.creator}}" id="{{task.id}}">
                                 <div class="table-cell check-box">
@@ -39,6 +39,8 @@
                                         Active list task
                                     {%elif task.type == 'follow-ups'%}
                                         Active follow-up task
+                                    {%elif task.type == 'comments'%}
+                                        Active comment task
                                     {%else%}
                                         Active scraper task
                                     {%endif%}
@@ -60,7 +62,7 @@
                                             <li class="tags">
                                                 {%if task.type == 'users'%}
                                                     {%set _type_url = 'creators'%}
-                                                {%elif task.type in ['lists', 'follow-ups']%}
+                                                {%elif task.type in ['lists', 'follow-ups', 'comments']%}
                                                     {%set _type_url = 'messages'%}
                                                 {%else%}
                                                     {%set _type_url = task.type%}
@@ -96,7 +98,7 @@
                 <div class="table-body" id="other-tasks-table-body">
                     {# Then, render all other tasks (excluding running 'messages' and 'scraper') #}
                     {% for task in tasks %}
-                        {% if not (task.type in ['messages','follow-ups','scraper','lists'] and task.status|lower == 'running') %}
+                        {% if not (task.type in ['messages','follow-ups','comments','scraper','lists'] and task.status|lower == 'running') %}
                             <div data-action-url="{{ url_for('tasks',action='view-item',task=task.id) }}" 
                                 class="table-row" data-item="{{task.id}}" data-action-target="{{task.creator}}" id="{{task.id}}">
                                 <div class="table-cell check-box">
@@ -123,7 +125,7 @@
                                             <li class="tags">
                                                 {%if task.type == 'users'%}
                                                     {%set _type_url = 'creators'%}
-                                                {%elif task.type in ['lists', 'follow-ups']%}
+                                                {%elif task.type in ['lists', 'follow-ups', 'comments']%}
                                                     {%set _type_url = 'messages'%}
                                                 {%else%}
                                                     {%set _type_url = task.type%}

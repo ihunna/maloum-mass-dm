@@ -4,6 +4,20 @@
 {% endblock %} 
 
 {%block main_content%}
+    {% macro task_tabs(current) %}
+        {% set tabs = [
+            ('start-messaging', url_for('messages', action='start-messaging'), 'fa-paper-plane', 'Messanger'),
+            ('start-follow-up', url_for('messages', action='start-follow-up'), 'fa-reply', 'Follow up'),
+            ('start-commenting', url_for('messages', action='start-commenting'), 'fa-comment', 'Comments'),
+            ('start-scraping', url_for('scraper'), 'fa-search', 'Scraper'),
+            ('sync-lists', url_for('messages', action='sync-lists'), 'fa-list', 'Lists'),
+        ] %}
+        <nav class="alt-tab">
+            {% for key, href, icon, label in tabs %}
+                <a href="{{ href }}" class="{{ 'active' if key == current }}"><i class="fas {{ icon }}"></i>{{ label }}</a>
+            {% endfor %}
+        </nav>
+    {% endmacro %}
     
     <style>
         .message-holder{
@@ -63,20 +77,20 @@
     </style>
     
     
-    {%if action in ['start-messaging', 'start-follow-up']%}
+    {%if action in ['start-messaging', 'start-follow-up', 'start-commenting']%}
         {% set follow_up = action == 'start-follow-up' %}
+        {% set commenting = action == 'start-commenting' %}
         <section class="add-message">
             <div class="holder form-holder">
-                    <div class="alt-tab">
-                        {%if follow_up%}
-                            <a href="{{url_for('messages', action='start-messaging')}}">Messanger <i class="fas fa-arrow-right"></i></a>
-                        {%else%}
-                            <a href="{{url_for('messages', action='start-follow-up')}}">Follow up <i class="fas fa-arrow-right"></i></a>
-                        {%endif%}
-                        <a href="{{url_for('scraper')}}" style="margin-left: 10px;">Scraper <i class="fas fa-arrow-right"></i></a>
-                        <a href="{{url_for('messages', action='sync-lists')}}" style="margin-left: 10px;">Lists <i class="fas fa-arrow-right"></i></a>
-                    </div>
-                    {%if follow_up%}
+                    {{ task_tabs(action) }}
+                    {%if commenting%}
+                    <form action="" id="comments-form" data-action="Create comment task"
+                        data-action-url="{{ url_for('handle_comments') }}" data-action-message="Creating comment task..."
+                        data-next-action-url="{{ url_for('tasks') }}">
+                    <h3 class="form-header">
+                        Fill the form to have creators comment on discovery posts.
+                    </h3>
+                    {%elif follow_up%}
                     <form action="" id="follow-up-form" data-action="Create follow-up"
                         data-action-url="{{ url_for('handle_follow_ups') }}" data-action-message="Creating follow-up..."
                         data-next-action-url="{{ url_for('tasks') }}">
@@ -132,7 +146,7 @@
                         </div>
                         <div class="input-container max-actions">
                             <input type="number" id="max-actions" name="max-actions" value="10" max="50" autofocus tocomplete="delay" required>
-                            <label for="max-actions">{%if follow_up%}Number of follow-ups per iteration{%else%}Number of messages per interation{%endif%}</label>
+                            <label for="max-actions">{%if follow_up%}Number of follow-ups per iteration{%elif commenting%}Number of comments per iteration{%else%}Number of messages per interation{%endif%}</label>
                         </div>
                         <div class="input-container flex radio">
                             <span style="padding: 0; margin: 0 auto 0 0;">
@@ -181,6 +195,7 @@
                         {%endif%}
                     </div>
                     <div class="message-holder">
+                        {%if not commenting%}
                         <div class="input-container flex radio">
                             <span style="padding: 0; margin: 0 auto 0 0;">
                                 Choose the message pricing
@@ -198,6 +213,7 @@
                             <input type="number" id="message-price" name="message-price" value="0" tocomplete="delay" required>
                             <label for="message-price">Price</label>
                         </div>
+                        {%endif%}
                         <div class="input-container flex radio">
                             <span style="padding: 0; margin: 0 auto 0 0;">
                                 Choose captions source
@@ -210,12 +226,10 @@
                                 <input type="radio" class="captions" id="message-caption-universal" name="message-caption-source" value="universal" checked>
                                 <label for="message-caption-universal">Use universal caption</label>
                             </div>
-                            {%if follow_up%}
                             <div class="radio-box">
                                 <input type="radio" class="captions" id="message-caption-pool" name="message-caption-source" value="pool">
-                                <label for="message-caption-pool">Use follow-up pool</label>
+                                <label for="message-caption-pool">{%if commenting%}Use comment pool{%elif follow_up%}Use follow-up pool{%else%}Use message pool{%endif%}</label>
                             </div>
-                            {%endif%}
                         </div>
                         <div class="input-container">
                             <select name="message-caption" id="message-caption" required>
@@ -225,12 +239,11 @@
                                 {%endfor%}
                             </select>
                         </div>
-                        {%if follow_up%}
                         <div class="input-container" style="display: none;">
                             <textarea class="scroll scroll-v" name="follow-up-pool" id="follow-up-pool" rows="10"></textarea>
-                            <label for="follow-up-pool">Follow-up captions (one per line)</label>
+                            <label for="follow-up-pool">{%if commenting%}Comments (one per line){%elif follow_up%}Follow-up captions (one per line){%else%}Messages (one per line){%endif%}</label>
                         </div>
-                        {%endif%}
+                        {%if not commenting%}
                         <div class="input-container flex radio">
                             <span style="padding: 0; margin: 0 auto 0 0;">
                                 Use media?
@@ -244,6 +257,7 @@
                                 <label for="use-media-no">No</label>
                             </div>
                         </div>
+                        {%endif%}
                         <!-- <div class="input-container" id="media-id-container" style="display: none;">
                             <input type="text" id="media-id" name="media-id" placeholder="Enter 4based media ID">
                             <label for="media-id">Media ID</label>
@@ -390,10 +404,7 @@
     {%elif action == 'sync-lists'%}
         <section class="add-lists">
             <div class="holder form-holder">
-                    <div class="alt-tab">
-                        <a href="{{url_for('messages', action='start-messaging')}}">Messanger <i class="fas fa-arrow-right"></i></a>
-                        <a href="{{url_for('messages', action='start-follow-up')}}" style="margin-left: 10px;">Follow up <i class="fas fa-arrow-right"></i></a>
-                    </div>
+                    {{ task_tabs(action) }}
                     <form action="" id="lists-form" data-action="Sync lists"
                         data-action-url="{{ url_for('handle_list_sync') }}" data-action-message="Starting list sync..."
                         data-next-action-url="{{ url_for('tasks') }}">
@@ -499,10 +510,7 @@
     {%elif action == 'start-scraping'%}
         <section class="add-scraper">
             <div class="holder form-holder">
-                    <div class="alt-tab">
-                        <a href="{{url_for('messages', action='start-messaging')}}">Messanger <i class="fas fa-arrow-right"></i></a>
-                        <a href="{{url_for('messages', action='start-follow-up')}}" style="margin-left: 10px;">Follow up <i class="fas fa-arrow-right"></i></a>
-                    </div>
+                    {{ task_tabs(action) }}
                     <form action="" id="scraper-form" data-action="Scrape accounts" 
                         data-action-url="{{ url_for('scraper') }}" data-action-message="Staring scraper..." 
                         data-next-action-url="{{ url_for('tasks') }}">
