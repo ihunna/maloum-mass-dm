@@ -694,7 +694,8 @@ def handle_messages():
             'admin': admin,
             'time_between': int(data.get('time-between-actions', '3600')),
             'proxy_flush': True if str(data.get('proxy-flush', 'no')).lower() == 'yes' else False,
-            'delete_blocked': str(data.get('delete-blocked', 'no')).lower() == 'yes'
+            'delete_blocked': str(data.get('delete-blocked', 'no')).lower() == 'yes',
+            'shard_targets': str(data.get('shard-targets', 'no')).lower() == 'yes'
         }
         if message_data['caption_source'] == 'pool' and not message_data['caption_pool']:
             return jsonify({'msg': 'Add at least one message to the pool'}), 400

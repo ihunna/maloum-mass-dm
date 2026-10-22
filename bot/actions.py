@@ -1370,7 +1370,7 @@ class Creator:
         except Exception as e:
             return False, f'Error syncing list for {creator.get("id")}: {str(e)}'
 
-    async def send_messages(self, admin, task_id, creator, scrapers, config, max_actions):
+    async def send_messages(self, admin, task_id, creator, scrapers, config, max_actions, shard_index=None, shard_count=None):
         try:
             success, task_status = Utils.check_task_status(task_id)
             if not success:
@@ -1449,7 +1449,7 @@ class Creator:
                 # 🔁 Pull only users NOT previously messaged by this creator (from DB)
                 while found_users < max_actions:
                     # expects you have Utils.get_unmessaged_users(creator_id, limit, offset) implemented
-                    success, new_users = Utils.get_unmessaged_users(creator_internal_id, limit=limit, offset=offset, recipient_type=recipient_type)
+                    success, new_users = Utils.get_unmessaged_users(creator_internal_id, limit=limit, offset=offset, recipient_type=recipient_type, shard_index=shard_index, shard_count=shard_count)
                     if not success:raise Exception(new_users)
                     if not new_users:break
 
@@ -2730,9 +2730,17 @@ class _MALOUM:
                         for creator in creators
                     ]
                 else:
+                    # Sharding only applies to first messages: each sender
+                    # gets a disjoint slice of the target pool. Follow-ups
+                    # are per-sender chats, so they are never sharded.
+                    shard = bool(config.get('shard_targets')) and len(creators) > 1
                     tasks = [
-                        Creator().send_messages(admin, task_id, creator, scrapers, config, max_actions)
-                        for creator in creators
+                        Creator().send_messages(
+                            admin, task_id, creator, scrapers, config, max_actions,
+                            shard_index=index if shard else None,
+                            shard_count=len(creators) if shard else None
+                        )
+                        for index, creator in enumerate(creators)
                     ]
                 results = await asyncio.gather(*tasks, return_exceptions=True)
 

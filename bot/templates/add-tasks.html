@@ -191,6 +191,21 @@
                             </div>
                         </div>
                         {%endif%}
+                        {%if not commenting and not follow_up%}
+                        <div class="input-container flex radio">
+                            <span style="padding: 0; margin: 0 auto 0 0;">
+                                Split targets between senders
+                            </span>
+                            <div class="radio-box">
+                                <input type="radio" class="shard-targets" id="shard-targets-yes" name="shard-targets" value="yes">
+                                <label for="shard-targets-yes">Yes</label>
+                            </div>
+                            <div class="radio-box">
+                                <input type="radio" class="shard-targets" id="shard-targets-no" name="shard-targets" value="no" checked>
+                                <label for="shard-targets-no">No</label>
+                            </div>
+                        </div>
+                        {%endif%}
                         {%if not commenting%}
                         <div class="input-container flex radio">
                             <span style="padding: 0; margin: 0 auto 0 0;">
