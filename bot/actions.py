@@ -860,7 +860,11 @@ class Creator:
             except Exception as e:
                 return False, f'Error saving media ID {post_id} for creator {creator_id}: {str(e)}'
 
-    async def scrape_users(self, scraper, admin, task_id, count=50, limit=50, offset=0, last_activity=7, delete_blocked=False, rotate_user=None):
+    async def scrape_users(self, scraper, admin, task_id, count=50, limit=50, offset=0, last_activity=7, delete_blocked=False, rotate_user=None, recipient_type='users'):
+        if recipient_type not in ('users', 'creators', 'both'):
+            recipient_type = 'users'
+        want_users = recipient_type in ('users', 'both')
+        want_creators = recipient_type in ('creators', 'both')
         try:
             if not isinstance(scraper, dict) or not scraper.get('id'):
                 return False, f'Scraper is not logged in: {scraper}'
@@ -947,37 +951,40 @@ class Creator:
                 total_creators = 0
                 total_existing = 0
                 valid_users = []
+                valid_creators = []
                 candidate_users = []
+                candidate_creators = []
                 BATCH_SIZE = 100
                 lock = asyncio.Lock()
 
                 async def flush_candidates():
-                    nonlocal candidate_users, valid_users, total_creators, total_existing
-                    if not candidate_users:
-                        return
+                    nonlocal candidate_users, candidate_creators, valid_users, valid_creators, total_creators, total_existing
+                    for candidates, category, valid in (
+                        (candidate_users, 'scraped', valid_users),
+                        (candidate_creators, 'creator', valid_creators),
+                    ):
+                        while candidates:
+                            batch = candidates[:BATCH_SIZE]
+                            del candidates[:BATCH_SIZE]
 
-                    while candidate_users:
-                        batch = candidate_users[:BATCH_SIZE]
-                        candidate_users = candidate_users[BATCH_SIZE:]
+                            batch_ids = [u["_id"] for u in batch]
 
-                        batch_ids = [u["_id"] for u in batch]
+                            success, existing_ids = Utils.get_existing_user_ids(batch_ids, admin=admin)
+                            if not success:
+                                Utils.write_log(f"DB check failed: {existing_ids}")
+                                return
 
-                        success, existing_ids = Utils.get_existing_user_ids(batch_ids, admin=admin)
-                        if not success:
-                            Utils.write_log(f"DB check failed: {existing_ids}")
-                            return
+                            new_users = [u for u in batch if u["_id"] not in existing_ids]
 
-                        new_users = [u for u in batch if u["_id"] not in existing_ids]
+                            if new_users:
+                                success, msg = Utils.add_users(new_users, admin=admin, task_id=task_id, category=category)
+                                if not success:Utils.write_log(f"Insert failed: {msg}")
+                                else:valid.extend(new_users)
 
-                        if new_users:
-                            success, msg = Utils.add_users(new_users, admin=admin, task_id=task_id)
-                            if not success:Utils.write_log(f"Insert failed: {msg}")
-                            else:valid_users.extend(new_users)
-
-                        if existing_ids:
-                            client_msg = {'msg': f'Skipped {len(existing_ids)} users because they already exist in the database', 'status': 'success', 'type': 'message'}
-                            Utils.update_client(client_msg)
-                            total_existing += len(existing_ids)
+                            if existing_ids:
+                                client_msg = {'msg': f'Skipped {len(existing_ids)} users because they already exist in the database', 'status': 'success', 'type': 'message'}
+                                Utils.update_client(client_msg)
+                                total_existing += len(existing_ids)
 
 
                 semaphore = asyncio.Semaphore(1)
@@ -991,7 +998,7 @@ class Creator:
                 )
                 async def process_post(post):
                     try:
-                        nonlocal total_creators, total_existing, candidate_users, valid_users
+                        nonlocal total_creators, total_existing, candidate_users, candidate_creators, valid_users, valid_creators
                         # # add an initial random delay so not all tasks fire at once
                         # await asyncio.sleep(random.uniform(1, 5))
 
@@ -1062,22 +1069,23 @@ class Creator:
                                         "commented_at": comment.get("createdAt")
                                     }
 
-                                    if not u.get('isCreator', True):
+                                    if u.get('isCreator', True):
+                                        if want_creators:
+                                            async with lock:
+                                                candidate_creators.append(user)
+                                    elif want_users:
                                         async with lock:
-                                            # if len(valid_users) >= count:
-                                            #     await flush_candidates()
-                                            #     return True, f'{post.get("commentCount")} processed for post {post_id}'
-
                                             candidate_users.append(user)
-                                            # if len(candidate_users) >= BATCH_SIZE:
-                                            #     await flush_candidates()
                                 if not _next:
                                     break
 
                         await flush_candidates()
 
                         if len(creators) > 0:
-                            client_msg = {'msg': f"Skipped {len(creators)} creators on post {post_id}", 'status': 'success', 'type': 'message'}
+                            if want_creators:
+                                client_msg = {'msg': f"Saved {len(creators)} creators on post {post_id}", 'status': 'success', 'type': 'message'}
+                            else:
+                                client_msg = {'msg': f"Skipped {len(creators)} creators on post {post_id}", 'status': 'success', 'type': 'message'}
                             Utils.update_client(client_msg)
                             total_creators += len(creators)
 
@@ -1101,12 +1109,18 @@ class Creator:
                     elif isinstance(result, tuple) and not result[0]:
                         Utils.write_log(result[1])
 
-                if not valid_users and (total_creators > 0 or total_existing > 0):
-                    raise Exception(f'No users found | Because {total_creators} creators were skipped and {total_existing} existing users already exist in the database')
+                if not valid_users and not valid_creators and (total_creators > 0 or total_existing > 0):
+                    skipped = f' and {total_creators} creators were skipped' if not want_creators else ''
+                    raise Exception(f'No new recipients found | Because {total_existing} existing recipients already exist in the database{skipped}')
                 finished = rotate_user.active_session if rotate_user is not None and rotate_user.active_session else scraper
-                if not valid_users:
+                if not valid_users and not valid_creators:
                     return False, f'No valid users found for {finished.get("id")}'
-                return True, f'Scraped {len(valid_users)} users by {finished.get("id")}'
+                scraped_parts = []
+                if valid_users:
+                    scraped_parts.append(f'{len(valid_users)} users')
+                if valid_creators:
+                    scraped_parts.append(f'{len(valid_creators)} creators')
+                return True, f'Scraped {" and ".join(scraped_parts)} by {finished.get("id")}'
 
         except (SessionExpired, AccountBlockedError):
             raise
@@ -1383,6 +1397,11 @@ class Creator:
             creator_id = creator_data['details']['user']['_id']
             creator_internal_id = creator['id']
 
+            recipient_type = config.get('recipient_type', 'users')
+            if recipient_type not in ('users', 'creators', 'both'):
+                recipient_type = 'users'
+            recipient_label = {'users': 'users', 'creators': 'creators', 'both': 'users and creators'}[recipient_type]
+
             caption = config.get('caption', '')
             caption_source = config.get('caption_source', 'creator')
             has_media = config.get('has_media', False)
@@ -1406,10 +1425,10 @@ class Creator:
 
             # NOTE: scraping is handled elsewhere now; this function only pulls from DB
             offset = creator_data.get('message_offset', 0)
-            client_msg = {'msg': f'Fetching users from DB (unmessaged by {creator_name}) offset {offset}', 'status': 'success', 'type': 'message'}
+            client_msg = {'msg': f'Fetching {recipient_label} from DB (unmessaged by {creator_name}) offset {offset}', 'status': 'success', 'type': 'message'}
             success, msg = Utils.update_client(client_msg)
 
-            Utils.write_log(f"--- Fetching users from DB (unmessaged by {creator_name}) offset {offset} ---")
+            Utils.write_log(f"--- Fetching {recipient_label} from DB (unmessaged by {creator_name}) offset {offset} ---")
 
             async with _http_session() as session:
                 session.headers.update(creator_data.get('headers'))
@@ -1420,7 +1439,7 @@ class Creator:
                 limit = max_actions
                 users, found_users = [], 0
 
-                success, msg, total_users = Utils.get_users(admin)
+                success, msg, total_users = Utils.get_users(admin, recipient_type=recipient_type)
                 if not success:raise Exception(msg)
 
                 if offset >= total_users:offset = 0
@@ -1428,7 +1447,7 @@ class Creator:
                 # 🔁 Pull only users NOT previously messaged by this creator (from DB)
                 while found_users < max_actions:
                     # expects you have Utils.get_unmessaged_users(creator_id, limit, offset) implemented
-                    success, new_users = Utils.get_unmessaged_users(creator_internal_id, limit=limit, offset=offset)
+                    success, new_users = Utils.get_unmessaged_users(creator_internal_id, limit=limit, offset=offset, recipient_type=recipient_type)
                     if not success:raise Exception(new_users)
                     if not new_users:break
 
@@ -1447,7 +1466,7 @@ class Creator:
                 random.shuffle(users)
 
                 if len(users) == 0:
-                    return False, f'No unmessaged users found for {creator_name} at offset {offset}'
+                    return False, f'No unmessaged {recipient_label} found for {creator_name} at offset {offset}'
 
                 for user in users:
                     try:
@@ -1464,6 +1483,10 @@ class Creator:
                             Utils.write_log(f"--- Skipping user without id: {user} ---")
                             continue
                         username = user.get('username', 'unknown')
+
+                        if recipient_id == creator_id:
+                            Utils.write_log(f"--- Skipping {username}; creator cannot message themselves ---")
+                            continue
 
                         already_ok, already = Utils.has_message(creator_id=creator_internal_id, recipient_id=recipient_id)
                         if already_ok and already:
@@ -1493,21 +1516,27 @@ class Creator:
                                 continue
                             
                             chat_data = await response.json()
-                            if chat_data.get('chatPartner',{}).get('isCreator', True):
+                            partner_is_creator = (chat_data.get('chatPartner') or {}).get('isCreator', True)
+                            if partner_is_creator and recipient_type == 'users':
                                 client_msg = {'msg': f"Skipping chat with {username} because it is a creator", 'status': 'error', 'type': 'message'}
                                 success, msg = Utils.update_client(client_msg)
                                 Utils.write_log(f"--- Skipping user {username} who is a creator ---")
-                                
+
                                 success,msg = Utils.delete_user(recipient_id)
                                 if not success:
                                     Utils.write_log(f"--- Failed to delete user {username} who is a creator: {msg} ---")
-                                
+
                                 else:
                                     client_msg = {'msg': f"Deleted {username} because it is a creator", 'status': 'error', 'type': 'message'}
                                     success, msg = Utils.update_client(client_msg)
                                     Utils.write_log(f"--- Deleted user {username} who is a creator ---")
                                 continue
-                            
+                            if not partner_is_creator and recipient_type == 'creators':
+                                client_msg = {'msg': f"Skipping chat with {username} because it is not a creator", 'status': 'error', 'type': 'message'}
+                                success, msg = Utils.update_client(client_msg)
+                                Utils.write_log(f"--- Skipping user {username} who is not a creator ---")
+                                continue
+
                             chat_id = (chat_data).get('_id')
                             if not chat_id:
                                 client_msg = {'msg': f"--- No chat ID found for user {recipient_id} ---", 'status': 'error', 'type': 'message'}
@@ -1688,10 +1717,10 @@ class Creator:
             
             throttled = f' (throttled {throttle.hits} times)' if throttle.hits else ''
             if success_messages > 0:
-                return True, f'Successfully sent messages to {success_messages} users by {creator_name}{throttled}'
+                return True, f'Successfully sent messages to {success_messages} {recipient_label} by {creator_name}{throttled}'
             if backfilled_messages > 0:
                 return True, f'No new messages sent by {creator_name}; recorded {backfilled_messages} existing chats{throttled}'
-            return False, f'{creator_name} could not send any messages to users{throttled}'
+            return False, f'{creator_name} could not send any messages to {recipient_label}{throttled}'
 
         except Exception as e:
             return False, f'Error sending messages to users for {creator.get("id")}: {str(e)}'
@@ -1785,7 +1814,10 @@ class Creator:
                 if not captions:
                     raise ValueError('Follow-up caption pool can not be empty')
 
-            success, candidates = Utils.get_resend_candidates(creator_internal_id, hours, limit=max_actions * 5)
+            recipient_type = config.get('recipient_type', 'users')
+            if recipient_type not in ('users', 'creators', 'both'):
+                recipient_type = 'users'
+            success, candidates = Utils.get_resend_candidates(creator_internal_id, hours, limit=max_actions * 5, recipient_type=recipient_type)
             if not success:
                 raise Exception(candidates)
             if not candidates:
@@ -2954,6 +2986,7 @@ class _MALOUM:
                 scraper, admin, task_id, count=count, last_activity=last_activity, offset=offset,
                 delete_blocked=bool(config.get('delete_blocked')),
                 rotate_user=rotate_user,
+                recipient_type=config.get('recipient_type', 'users'),
             )
         except SessionExpired as error:
             target = rotate_user.active_target if rotate_user is not None and rotate_user.active_target else target_scraper
@@ -2979,6 +3012,7 @@ class _MALOUM:
                     scraper, admin, task_id, count=count, last_activity=last_activity, offset=offset,
                     delete_blocked=bool(config.get('delete_blocked')),
                     rotate_user=rotate_user,
+                    recipient_type=config.get('recipient_type', 'users'),
                 )
             except SessionExpired as error:
                 return False, f'Session for {email} was rejected again after relogin: {error}'

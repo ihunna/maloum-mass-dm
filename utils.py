@@ -818,14 +818,21 @@ class Utils:
             conn.close()
 
     @staticmethod
-    def get_resend_candidates(creator_id, hours, limit=50):
+    def get_resend_candidates(creator_id, hours, limit=50, recipient_type='users'):
         try:
             conn = sqlite3.connect(db_file)
             cursor = conn.cursor()
-            cursor.execute("""
+            if recipient_type == 'creators':
+                category_sql = "AND EXISTS (SELECT 1 FROM users u WHERE u.id = messages.recipient_id AND u.category = 'creator')"
+            elif recipient_type == 'both':
+                category_sql = ''
+            else:
+                category_sql = "AND NOT EXISTS (SELECT 1 FROM users u WHERE u.id = messages.recipient_id AND u.category = 'creator')"
+            cursor.execute(f"""
                 SELECT recipient_id, recipient_name
                 FROM messages
                 WHERE creator_id = ?
+                {category_sql}
                 GROUP BY recipient_id
                 HAVING MAX(created_at) <= datetime('now', ?)
                 ORDER BY RANDOM()
@@ -1027,12 +1034,14 @@ class Utils:
         
 
     @staticmethod
-    def add_user(user_id,admin,username,commented_at,task_id=None):
+    def add_user(user_id,admin,username,commented_at,task_id=None,category='scraped'):
         success,msg = False,''
         conn = sqlite3.connect(db_file)
         cursor = conn.cursor()
         try:
-            cursor.execute("INSERT INTO users (id, admin, username, commented_at, task_id) VALUES (?, ?, ?, ?, ?) ON CONFLICT(id) DO NOTHING", (user_id,admin,username,commented_at,task_id))
+            if category not in ('scraped', 'uploaded', 'creator'):
+                category = 'scraped'
+            cursor.execute("INSERT INTO users (id, admin, username, commented_at, task_id, category) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO NOTHING", (user_id,admin,username,commented_at,task_id,category))
             conn.commit()
             
             success,msg = True, 'User added successfully'
@@ -1079,7 +1088,7 @@ class Utils:
         
 
     @staticmethod
-    def get_users(admin, limit=20, offset=0, constraint=None, keyword=None, category=None):
+    def get_users(admin, limit=20, offset=0, constraint=None, keyword=None, category=None, recipient_type=None):
         success, users, total_users = True, [], 0
         conn = sqlite3.connect(db_file)
         cursor = conn.cursor()
@@ -1109,11 +1118,18 @@ class Utils:
                     'category': row[8]
                     } for row in rows]
             else:
-                if category in ['scraped','uploaded']:
+                if category in ['scraped','uploaded','creator']:
                     cursor.execute("SELECT COUNT(*) FROM users WHERE admin = ? AND category = ?", (admin, category))
                     total_users = cursor.fetchone()[0]
 
                     cursor.execute("SELECT * FROM users WHERE admin = ? AND category = ? ORDER BY created_at DESC LIMIT ? OFFSET ?", (admin, category, limit, offset))
+                    rows = cursor.fetchall()
+                elif recipient_type in ('users', 'creators'):
+                    category_sql = "COALESCE(category, 'scraped') = 'creator'" if recipient_type == 'creators' else "COALESCE(category, 'scraped') != 'creator'"
+                    cursor.execute(f"SELECT COUNT(*) FROM users WHERE admin = ? AND {category_sql}", (admin,))
+                    total_users = cursor.fetchone()[0]
+
+                    cursor.execute(f"SELECT * FROM users WHERE admin = ? AND {category_sql} ORDER BY created_at DESC LIMIT ? OFFSET ?", (admin, limit, offset))
                     rows = cursor.fetchall()
                 else:
                     cursor.execute("SELECT COUNT(*) FROM users WHERE admin = ?", (admin,))
@@ -1175,16 +1191,24 @@ class Utils:
         
 
     @staticmethod
-    def get_unmessaged_users(creator_id, limit=50, offset=0):
+    def get_unmessaged_users(creator_id, limit=50, offset=0, recipient_type='users'):
         try:
             conn = sqlite3.connect(db_file)
             cursor = conn.cursor()
 
+            if recipient_type == 'creators':
+                category_sql = "AND COALESCE(u.category, 'scraped') = 'creator'"
+            elif recipient_type == 'both':
+                category_sql = ''
+            else:
+                category_sql = "AND COALESCE(u.category, 'scraped') != 'creator'"
+
             # Select users who do not exist in the messages table for this creator
-            cursor.execute("""
+            cursor.execute(f"""
                 SELECT u.id, u.username
                 FROM users u
                 WHERE u.status = 'active'
+                {category_sql}
                 AND u.id NOT IN (
                     SELECT m.recipient_id
                     FROM messages m
@@ -1204,7 +1228,7 @@ class Utils:
         
 
     @staticmethod
-    def add_users(users,admin=None,task_id=None):
+    def add_users(users,admin=None,task_id=None,category='scraped'):
         try:
             for user in users:
                 success,msg = Utils.add_user(
@@ -1212,7 +1236,8 @@ class Utils:
                     admin,
                     user.get('username'),
                     user.get('commented_at'),
-                    task_id=task_id
+                    task_id=task_id,
+                    category=category
                 )
                 if not success:return False, msg
             return True, f'saved all {len(users)} users'

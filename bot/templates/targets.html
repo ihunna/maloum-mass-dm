@@ -26,6 +26,12 @@
                         Scraped
                     </a>
                 </li>
+                <li class="{%if category=='creator'%} active {%endif%}">
+                    <a 
+                        href="{{ url_for('targets', category='creator') }}">
+                        Creators
+                    </a>
+                </li>
                 <li>
                     <a href="{{ url_for('files', category='targets') }}">
                         Add targets
