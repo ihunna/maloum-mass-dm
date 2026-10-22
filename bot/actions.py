@@ -1384,8 +1384,10 @@ class Creator:
             email = creator['data']['details']['user']['email']
             password = creator['data']['details']['user']['password']
 
+            sender_category = 'users' if config.get('sender_type') == 'users' else 'creators'
             success, _creator = await self.login(
                 admin, email, password, reuse_ip=self._reuse_ip(creator, config), task_id=task_id,
+                category=sender_category,
                 delete_blocked=bool(config.get('delete_blocked'))
             )
             if not success:
@@ -1694,7 +1696,7 @@ class Creator:
                         Utils.write_log(f'--- Session for {creator_name} expired, refreshing: {e} ---')
                         success, refreshed = await self.login(
                             admin, email, password, reuse_ip=self._reuse_ip(creator, config),
-                            task_id=task_id, stale_token=_auth_token(session.headers),
+                            task_id=task_id, category=sender_category, stale_token=_auth_token(session.headers),
                             delete_blocked=bool(config.get('delete_blocked'))
                         )
                         if not success:
@@ -1778,8 +1780,10 @@ class Creator:
 
             email = creator['data']['details']['user']['email']
             password = creator['data']['details']['user']['password']
+            sender_category = 'users' if config.get('sender_type') == 'users' else 'creators'
             success, creator_data = await self.login(
                 admin, email, password, reuse_ip=self._reuse_ip(creator, config), task_id=task_id,
+                category=sender_category,
                 delete_blocked=bool(config.get('delete_blocked'))
             )
             if not success:
@@ -1959,7 +1963,7 @@ class Creator:
                         Utils.write_log(f'--- Session for {creator_name} expired, refreshing: {e} ---')
                         success, refreshed = await self.login(
                             admin, email, password, reuse_ip=self._reuse_ip(creator, config),
-                            task_id=task_id, stale_token=_auth_token(session.headers),
+                            task_id=task_id, category=sender_category, stale_token=_auth_token(session.headers),
                             delete_blocked=bool(config.get('delete_blocked'))
                         )
                         if not success:
@@ -2004,8 +2008,10 @@ class Creator:
 
             email = creator['data']['details']['user']['email']
             password = creator['data']['details']['user']['password']
+            sender_category = 'creators'
             success, creator_data = await self.login(
                 admin, email, password, reuse_ip=self._reuse_ip(creator, config), task_id=task_id,
+                category=sender_category,
                 delete_blocked=bool(config.get('delete_blocked'))
             )
             if not success:
@@ -2078,7 +2084,7 @@ class Creator:
                         Utils.write_log(f'--- Session for {creator_name} expired, refreshing: {e} ---')
                         success, refreshed = await self.login(
                             admin, email, password, reuse_ip=self._reuse_ip(creator, config),
-                            task_id=task_id, stale_token=_auth_token(session.headers),
+                            task_id=task_id, category=sender_category, stale_token=_auth_token(session.headers),
                             delete_blocked=bool(config.get('delete_blocked'))
                         )
                         if not success:
@@ -2163,7 +2169,7 @@ class Creator:
                         Utils.write_log(f'--- Session for {creator_name} expired, refreshing: {e} ---')
                         success, refreshed = await self.login(
                             admin, email, password, reuse_ip=self._reuse_ip(creator, config),
-                            task_id=task_id, stale_token=_auth_token(session.headers),
+                            task_id=task_id, category=sender_category, stale_token=_auth_token(session.headers),
                             delete_blocked=bool(config.get('delete_blocked'))
                         )
                         if not success:
@@ -2654,7 +2660,18 @@ class _MALOUM:
                 '7200': '2 hours', '10800': '3 hours', '21600': '6 hours', '86400': '24 hours'
             }
 
-            success, creators, total_creators = Utils.get_creators(admin=admin, limit=100, selected_creators=selected_creators)
+            # Sender is chosen independently of recipients: send as creator
+            # accounts (default, legacy tasks) or as user accounts. The
+            # selected/universal source was already resolved into
+            # selected_senders by the route; old tasks only have
+            # selected_creators, which now holds that same selection.
+            sender_type = config.get('sender_type', 'creators')
+            if sender_type not in ('creators', 'users'):
+                sender_type = 'creators'
+            sender_category = 'users' if sender_type == 'users' else 'creators'
+            selected_senders = config.get('selected_senders') or selected_creators
+
+            success, creators, total_creators = Utils.get_creators(admin=admin, limit=100, selected_creators=selected_senders, category=sender_category)
             if not success:
                 raise Exception(creators)
 
@@ -2662,10 +2679,12 @@ class _MALOUM:
             if len_creators < total_creators:
                 for i in range(total_creators - len_creators):
                     offset = len_creators + i
-                    success, msg, total_creators = Utils.get_creators(admin=admin, limit=100, offset=offset, selected_creators=selected_creators)
+                    success, msg, total_creators = Utils.get_creators(admin=admin, limit=100, offset=offset, selected_creators=selected_senders, category=sender_category)
                     if not success:
                         raise Exception(msg)
                     creators.extend(msg)
+            if not creators:
+                raise Exception(f'No {sender_type[:-1]} accounts available to send from on {task_id}; add one first')
 
             scrapers = []
             if not follow_up:
@@ -2703,7 +2722,7 @@ class _MALOUM:
                     if not follow_up:
                         scrapers = _drop_deleted_accounts(scrapers)
                     if not creators:
-                        raise Exception(f'No active creator accounts left on {task_id}; blocked accounts are on the Deleted tab')
+                        raise Exception(f'No active {sender_type[:-1]} accounts left on {task_id}; blocked accounts are on the Deleted tab')
 
                 if follow_up:
                     tasks = [
