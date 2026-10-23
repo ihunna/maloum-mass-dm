@@ -236,14 +236,19 @@ def login_required(func):
     return decorated_function
 
 def check_role(func):
+    """Allow super-admin-only routes and return a consistent denial response.
+
+    This decorator is deliberately applied to both rendered pages and mutation
+    endpoints.  Hiding a navigation link alone does not prevent a regular
+    admin from calling the URL directly.
+    """
     @wraps(func)
     def decorated_function(*args, **kwargs):
         user = session.get('USER')
-        if user['role'] != 'super-admin':
+        if not user or user.get('role') != 'super-admin':
             if request.method == 'GET':
-                return redirect(url_for('admins'))
-            elif request.method in ['POST', 'DELETE', 'PUT', 'PATCH']:
-                return jsonify({'msg': 'You must be a super admin to update a user'}), 403
+                return redirect(url_for('index'))
+            return jsonify({'msg': 'This area is restricted to super admins'}), 403
         return func(*args, **kwargs)
     return decorated_function
     
@@ -264,6 +269,4 @@ def logout():
         return session.modified,'Logout successful'
     except Exception as error:
         return False,error
-    
-
     

@@ -730,15 +730,17 @@ class Utils:
         cursor = conn.cursor()
         try:
             if constraint is not None and keyword is not None:
-                cursor.execute(f"SELECT COUNT(*) FROM tasks WHERE {constraint} = ? AND admin = ?", (keyword, admin))
+                where = f"{constraint} = ?" + ("" if admin is None else " AND admin = ?")
+                params = (keyword,) if admin is None else (keyword, admin)
+                cursor.execute(f"SELECT COUNT(*) FROM tasks WHERE {where}", params)
                 total_tasks = cursor.fetchone()[0]
 
                 cursor.execute(
                     f"""SELECT * FROM tasks 
-                    WHERE {constraint} = ? AND admin = ?
+                    WHERE {where}
                     ORDER BY created_at DESC 
                     LIMIT ? OFFSET ?""",
-                    (keyword, admin, limit, offset)
+                    (*params, limit, offset)
                 )
                 rows = cursor.fetchall()
 
@@ -754,10 +756,14 @@ class Utils:
                 } for row in rows]
             else:
 
-                cursor.execute("SELECT COUNT(*) FROM tasks WHERE admin = ?", (admin,))
-                total_tasks = cursor.fetchone()[0]
-
-                cursor.execute("SELECT * FROM tasks WHERE admin = ? ORDER BY created_at DESC LIMIT ? OFFSET ?", (admin, limit, offset))
+                if admin is None:
+                    cursor.execute("SELECT COUNT(*) FROM tasks")
+                    total_tasks = cursor.fetchone()[0]
+                    cursor.execute("SELECT * FROM tasks ORDER BY created_at DESC LIMIT ? OFFSET ?", (limit, offset))
+                else:
+                    cursor.execute("SELECT COUNT(*) FROM tasks WHERE admin = ?", (admin,))
+                    total_tasks = cursor.fetchone()[0]
+                    cursor.execute("SELECT * FROM tasks WHERE admin = ? ORDER BY created_at DESC LIMIT ? OFFSET ?", (admin, limit, offset))
                 rows = cursor.fetchall()
 
                 tasks = [{
@@ -983,14 +989,21 @@ class Utils:
         try:
             if multiple:
                 if constraint is not None and keyword is not None:
-                    cursor.execute(f"SELECT COUNT(*) FROM messages WHERE {constraint} = ? AND admin = ?", (keyword, admin))
+                    where = f"{constraint} = ?" + ("" if admin is None else " AND admin = ?")
+                    params = (keyword,) if admin is None else (keyword, admin)
+                    cursor.execute(f"SELECT COUNT(*) FROM messages WHERE {where}", params)
                     total_messages = cursor.fetchone()[0]
                     cursor.execute(
-                        f"SELECT * FROM messages WHERE {constraint} = ? AND admin = ? ORDER BY created_at DESC LIMIT ? OFFSET ?", (keyword, admin, limit, offset))
+                        f"SELECT * FROM messages WHERE {where} ORDER BY created_at DESC LIMIT ? OFFSET ?", (*params, limit, offset))
                 else:
-                    cursor.execute("SELECT COUNT(*) FROM messages WHERE admin = ?", (admin,))
-                    total_messages = cursor.fetchone()[0]
-                    cursor.execute("SELECT * FROM messages WHERE admin = ? ORDER BY created_at DESC LIMIT ? OFFSET ?", (admin, limit, offset))
+                    if admin is None:
+                        cursor.execute("SELECT COUNT(*) FROM messages")
+                        total_messages = cursor.fetchone()[0]
+                        cursor.execute("SELECT * FROM messages ORDER BY created_at DESC LIMIT ? OFFSET ?", (limit, offset))
+                    else:
+                        cursor.execute("SELECT COUNT(*) FROM messages WHERE admin = ?", (admin,))
+                        total_messages = cursor.fetchone()[0]
+                        cursor.execute("SELECT * FROM messages WHERE admin = ? ORDER BY created_at DESC LIMIT ? OFFSET ?", (admin, limit, offset))
 
                 rows = cursor.fetchall()
                 messages = [{
@@ -1094,15 +1107,15 @@ class Utils:
         cursor = conn.cursor()
         try:
             if constraint is not None and keyword is not None:
-                cursor.execute(f"SELECT COUNT(*) FROM users WHERE {constraint} = ? AND admin = ?", (keyword, admin))
+                cursor.execute(f"SELECT COUNT(*) FROM users WHERE {constraint} = ?", (keyword,))
                 total_users = cursor.fetchone()[0]
 
                 cursor.execute(
                     f"""SELECT * FROM users 
-                    WHERE {constraint} = ? AND admin = ?
+                    WHERE {constraint} = ?
                     ORDER BY created_at DESC 
                     LIMIT ? OFFSET ?""",
-                    (keyword, admin, limit, offset)
+                    (keyword, limit, offset)
                 )
                 rows = cursor.fetchall()
 
@@ -1119,23 +1132,23 @@ class Utils:
                     } for row in rows]
             else:
                 if category in ['scraped','uploaded','creator']:
-                    cursor.execute("SELECT COUNT(*) FROM users WHERE admin = ? AND category = ?", (admin, category))
+                    cursor.execute("SELECT COUNT(*) FROM users WHERE category = ?", (category,))
                     total_users = cursor.fetchone()[0]
 
-                    cursor.execute("SELECT * FROM users WHERE admin = ? AND category = ? ORDER BY created_at DESC LIMIT ? OFFSET ?", (admin, category, limit, offset))
+                    cursor.execute("SELECT * FROM users WHERE category = ? ORDER BY created_at DESC LIMIT ? OFFSET ?", (category, limit, offset))
                     rows = cursor.fetchall()
                 elif recipient_type in ('users', 'creators'):
                     category_sql = "COALESCE(category, 'scraped') = 'creator'" if recipient_type == 'creators' else "COALESCE(category, 'scraped') != 'creator'"
-                    cursor.execute(f"SELECT COUNT(*) FROM users WHERE admin = ? AND {category_sql}", (admin,))
+                    cursor.execute(f"SELECT COUNT(*) FROM users WHERE {category_sql}")
                     total_users = cursor.fetchone()[0]
 
-                    cursor.execute(f"SELECT * FROM users WHERE admin = ? AND {category_sql} ORDER BY created_at DESC LIMIT ? OFFSET ?", (admin, limit, offset))
+                    cursor.execute(f"SELECT * FROM users WHERE {category_sql} ORDER BY created_at DESC LIMIT ? OFFSET ?", (limit, offset))
                     rows = cursor.fetchall()
                 else:
-                    cursor.execute("SELECT COUNT(*) FROM users WHERE admin = ?", (admin,))
+                    cursor.execute("SELECT COUNT(*) FROM users")
                     total_users = cursor.fetchone()[0]
 
-                    cursor.execute("SELECT * FROM users WHERE admin = ? ORDER BY created_at DESC LIMIT ? OFFSET ?", (admin, limit, offset))
+                    cursor.execute("SELECT * FROM users ORDER BY created_at DESC LIMIT ? OFFSET ?", (limit, offset))
                     rows = cursor.fetchall()
 
                 users = [{
@@ -1172,11 +1185,7 @@ class Utils:
             placeholders = ",".join(["?"] * len(user_ids))
             params = list(user_ids)
 
-            if admin is not None:
-                query = f"SELECT id FROM users WHERE id IN ({placeholders}) AND admin = ?"
-                params.append(admin)
-            else:
-                query = f"SELECT id FROM users WHERE id IN ({placeholders})"
+            query = f"SELECT id FROM users WHERE id IN ({placeholders})"
 
             cursor.execute(query, params)
             rows = cursor.fetchall()
@@ -1344,6 +1353,3 @@ class Utils:
         
 if __name__ == '__main__':
     print(Utils.compare_date('2025-08-13T08:32:00.630Z'))
-
-
-

@@ -83,7 +83,7 @@ def after_request(response):
 @login_required
 def index():
     g.page = 'dashboard'
-    admin = session['USER']['id']
+    admin = None if session['USER'].get('role') == 'super-admin' else session['USER']['id']
 
     success, creators, total_creators = Utils.get_creators(admin=admin, limit=5)
     if not success:
@@ -112,6 +112,7 @@ def index():
 
 @app.route('/admins', methods=['GET'])
 @login_required
+@check_role
 def admins():
     try:
         g.page = 'admins'
@@ -214,7 +215,11 @@ def handle_admin(action):
 @login_required
 def creators():
     try:
-        category = request.args.get('category', 'creators')
+        category = str(request.args.get('category', 'creators')).lower()
+        if category == 'users' and session['USER'].get('role') != 'super-admin':
+            return redirect(url_for('index'))
+        if category not in ('creators', 'users'):
+            abort(404)
         g.page = category
         page = request.args.get('page', 1, type=int)
         per_page = 20
@@ -295,6 +300,12 @@ def creators():
 @login_required
 def handle_creators(action):
     try:
+        # Regular admins can manage creator accounts only, never user accounts.
+        requested_category = str(request.form.get('category') or (request.get_json(silent=True) or {}).get('category') or 'creators').lower()
+        if requested_category not in ('creators', 'users'):
+            return jsonify({'msg': 'Invalid account category'}), 400
+        if requested_category == 'users' and session['USER'].get('role') != 'super-admin':
+            return jsonify({'msg': 'User accounts can only be managed by super admins'}), 403
         if action == 'add':
             if len(Utils.load_proxies()) < 1:
                 return jsonify({'msg': 'Proxies must not be empty'}), 400
@@ -302,7 +313,7 @@ def handle_creators(action):
             admin = session['USER']['id']
 
             creators = request.form.get('configs', '')
-            category = request.form.get('category', 'creators')
+            category = str(request.form.get('category', 'creators')).lower()
             if creators == '':
                 return jsonify({'msg': 'No creators to add'}), 400
             creators = creators.replace('\r', '').split('\n')
@@ -395,7 +406,11 @@ def handle_creators(action):
 def creator():
     try:
         if request.method == 'GET':
-            category = request.args.get('category', 'creators')
+            category = str(request.args.get('category', 'creators')).lower()
+            if category == 'users' and session['USER'].get('role') != 'super-admin':
+                return redirect(url_for('index'))
+            if category not in ('creators', 'users'):
+                abort(404)
             g.page = category
             creator = request.args.get('creator') if category == 'creators' else request.args.get('user')
             success, creator, _ = Utils.get_creators(multiple=False, creator=creator)
@@ -418,7 +433,11 @@ def creator():
         
         elif request.method == 'POST':
             data = request.get_json()
-            category = data.get('category', 'creators')
+            category = str(data.get('category', 'creators')).lower()
+            if category == 'users' and session['USER'].get('role') != 'super-admin':
+                return jsonify({'msg': 'User accounts can only be managed by super admins'}), 403
+            if category not in ('creators', 'users'):
+                abort(404)
             action = data['action']
             creator = data['creator'] if category == 'creators' else data['user']
 
@@ -477,6 +496,7 @@ def creator():
 
 @app.route('/targets', methods=['GET'])
 @login_required
+@check_role
 def targets():
     try:
         category = request.args.get('category', 'all')
@@ -560,6 +580,7 @@ def messages():
         offset = (page - 1) * per_page
 
         admin = session['USER']['id']
+        activity_admin = None if session['USER'].get('role') == 'super-admin' else admin
 
         if action in ['start-messaging', 'start-follow-up', 'start-commenting']:
             success, creators, total_creators = Utils.get_creators(admin=admin)
@@ -593,7 +614,7 @@ def messages():
             g.page = 'messages'
 
             success, messages, total_messages = Utils.get_messages(
-                admin=admin,
+                admin=activity_admin,
                 limit=per_page, 
                 offset=offset,
                 constraint=constraint, keyword=item)
@@ -629,7 +650,7 @@ def messages():
 
             return render_template('view-item.html', type='message', item=messages)
 
-        success, messages, total_messages = Utils.get_messages(admin=admin, limit=per_page, offset=offset)
+        success, messages, total_messages = Utils.get_messages(admin=activity_admin, limit=per_page, offset=offset)
         next_page = page + 1 if page < total_messages / per_page else page
         prev_page = page - 1 if page > 1 else page
         current_page = offset + len(messages)
@@ -1069,7 +1090,7 @@ def tasks():
         g.page = 'tasks'
         action = request.args.get('action')
 
-        admin = session['USER']['id']
+        admin = None if session['USER'].get('role') == 'super-admin' else session['USER']['id']
 
         if action and action == 'view-item':
             task_id = request.args.get('task')
@@ -1154,6 +1175,7 @@ def update_task(action):
 
 @app.route('/configs', methods=['GET'])
 @login_required
+@check_role
 def configs():
     try:
         g.page = 'configs'
@@ -1263,6 +1285,8 @@ def example_redirect():
     return redirect(url_for('index'))
 
 @app.route('/media/<creator>/<folder>/<filename>', methods=['GET'])
+@login_required
+@check_role
 def serve_image(creator, folder, filename):
     if folder in ['images', 'used_images']:
         image_folder = os.path.join(configs_folder, creator, folder)
@@ -1281,6 +1305,7 @@ def serve_image(creator, folder, filename):
 
 @app.route('/medias/<folder>/<action>/<creator>/<category>', methods=['POST'])
 @login_required
+@check_role
 def medias(action, folder, creator, category):
     try:
         if action == 'upload':
@@ -1312,6 +1337,7 @@ def medias(action, folder, creator, category):
 
 @app.route('/config/<tab>/<action>/<creator>', methods=['POST'])
 @login_required
+@check_role
 def config(tab, action, creator):
     try:
         configs_file = os.path.join(configs_folder, creator, f'{tab.lower()}.txt')
@@ -1331,6 +1357,7 @@ def config(tab, action, creator):
 
 @app.route('/files/<category>', methods=['GET'])
 @login_required
+@check_role
 def files(category):
     try:
         g.page = 'configs'
@@ -1353,6 +1380,7 @@ def files(category):
 
 @app.route('/files/<category>/update', methods=['POST'])
 @login_required
+@check_role
 def handle_files(category):
     try:
         g.page = 'configs'
@@ -1374,10 +1402,17 @@ def handle_files(category):
 @login_required
 def delete(category):
     try:
+        if session['USER'].get('role') != 'super-admin':
+            return jsonify({'msg': 'Only super admins can delete entries'}), 403
+        # Media lives in the protected configuration area, so protect this
+        # direct endpoint too (the UI is not a security boundary).
+        config_categories = {'images', 'videos', 'used_videos', 'used_images'}
+        if category in config_categories and session['USER'].get('role') != 'super-admin':
+            return jsonify({'msg': 'Configuration media can only be managed by super admins'}), 403
         data = request.get_json()['data']
         deleted = 0
 
-        if category in ['images', 'videos', 'used_videos', 'used_images']:
+        if category in config_categories:
             for item in data:
                 target, filename = item['target'], item['item']
                 folder = os.path.join(configs_folder, target, category)
