@@ -1178,7 +1178,6 @@ def update_task(action):
 
 @app.route('/configs', methods=['GET'])
 @login_required
-@check_role
 def configs():
     try:
         g.page = 'configs'
@@ -1187,6 +1186,15 @@ def configs():
         creator = request.args.get('creator', 'universal')
         images_folder = os.path.join(configs_folder, creator, 'images')
         videos_folder = os.path.join(configs_folder, creator, 'videos')
+
+        # Only proxies are restricted to super-admins
+        if tab == 'proxies' or (tab not in [
+            'images', 'used_images', 'videos', 'used_videos',
+            'upload-images', 'upload-videos', 'captions', 'comments'
+        ] and creator == 'universal'):
+            user = session.get('USER')
+            if not user or user.get('role') != 'super-admin':
+                return redirect(url_for('index'))
 
         if tab in ['images', 'used_images'] and creator != 'universal':
             category = request.args.get('category', None)
@@ -1289,7 +1297,6 @@ def example_redirect():
 
 @app.route('/media/<creator>/<folder>/<filename>', methods=['GET'])
 @login_required
-@check_role
 def serve_image(creator, folder, filename):
     if folder in ['images', 'used_images']:
         image_folder = os.path.join(configs_folder, creator, folder)
@@ -1308,7 +1315,6 @@ def serve_image(creator, folder, filename):
 
 @app.route('/medias/<folder>/<action>/<creator>/<category>', methods=['POST'])
 @login_required
-@check_role
 def medias(action, folder, creator, category):
     try:
         if action == 'upload':
@@ -1340,7 +1346,6 @@ def medias(action, folder, creator, category):
 
 @app.route('/config/<tab>/<action>/<creator>', methods=['POST'])
 @login_required
-@check_role
 def config(tab, action, creator):
     try:
         configs_file = os.path.join(configs_folder, creator, f'{tab.lower()}.txt')
@@ -1360,10 +1365,16 @@ def config(tab, action, creator):
 
 @app.route('/files/<category>', methods=['GET'])
 @login_required
-@check_role
 def files(category):
     try:
         g.page = 'configs'
+
+        # Only proxies are restricted to super-admins
+        if category == 'proxies':
+            user = session.get('USER')
+            if not user or user.get('role') != 'super-admin':
+                return redirect(url_for('index'))
+
         configs = []
         if category in ['proxies', 'captions', 'comments']:
             file = universal_files[category]
@@ -1383,10 +1394,15 @@ def files(category):
 
 @app.route('/files/<category>/update', methods=['POST'])
 @login_required
-@check_role
 def handle_files(category):
     try:
         g.page = 'configs'
+
+        # Only proxies are restricted to super-admins
+        if category == 'proxies':
+            user = session.get('USER')
+            if not user or user.get('role') != 'super-admin':
+                return jsonify({'msg': 'Proxies can only be managed by super admins'}), 403
         
         configs = request.form.get('configs', '')
         configs = configs.replace('\n', '')
@@ -1405,15 +1421,14 @@ def handle_files(category):
 @login_required
 def delete(category):
     try:
-        if session['USER'].get('role') != 'super-admin':
-            return jsonify({'msg': 'Only super admins can delete entries'}), 403
-        # Media lives in the protected configuration area, so protect this
-        # direct endpoint too (the UI is not a security boundary).
         config_categories = {'images', 'videos', 'used_videos', 'used_images'}
-        if category in config_categories and session['USER'].get('role') != 'super-admin':
-            return jsonify({'msg': 'Configuration media can only be managed by super admins'}), 403
         data = request.get_json()['data']
         deleted = 0
+
+        # Media (images/videos) can be managed by any admin.
+        # Everything else remains super-admin only.
+        if category not in config_categories and session['USER'].get('role') != 'super-admin':
+            return jsonify({'msg': 'Only super admins can delete entries'}), 403
 
         if category in config_categories:
             for item in data:
